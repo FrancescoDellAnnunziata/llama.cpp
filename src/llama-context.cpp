@@ -851,6 +851,26 @@ float * llama_context::get_embeddings_ith(int32_t i) {
     }
 }
 
+float llama_context::get_ais_surprise_ith(int32_t i) {
+    output_reorder();
+
+    try {
+        if (ais_surprise.empty()) {
+            throw std::runtime_error("no ais surprise output");
+        }
+
+        const int64_t j = output_resolve_row(i);
+        return ais_surprise[j];
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid ais surprise id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return 0.0f;
+#endif
+    }
+}
+
 float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     auto it = embd_seq.find(seq_id);
     if (it == embd_seq.end()) {
@@ -1038,6 +1058,17 @@ void llama_context::set_embeddings(bool value) {
 
     // TODO: not sure yet if we want to reserve here
     //sched_need_reserve = true;
+}
+
+void llama_context::set_eval_callback(ggml_backend_sched_eval_callback cb, void * user_data) {
+    // Toggle the scheduler eval-callback at runtime. With a callback set, the scheduler
+    // computes node-by-node with a synchronize per split (ggml-backend.cpp) — useful to
+    // capture tensors during prefill, but a per-decode tax during generation. Callers can
+    // null it for the generation loop and restore it for prefill. Updates cparams (so the
+    // next graph build re-applies it) and the live scheduler (so reused graphs honor it).
+    cparams.cb_eval           = cb;
+    cparams.cb_eval_user_data = user_data;
+    ggml_backend_sched_set_eval_callback(sched.get(), cb, user_data);
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1809,6 +1840,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // AIS gather-dot: extract the dedicated [1, n_outputs] surprise tensor. Only N floats
+        // per ubatch (vs n_embd_out×N for the embeddings path) → the readback tax goes to ~0.
+        if (auto * t_surprise = res->get_surprise(); t_surprise && n_outputs > 0 && !ais_surprise.empty()) {
+            ggml_backend_t backend_surprise = ggml_backend_sched_get_tensor_backend(sched.get(), t_surprise);
+            GGML_ASSERT(backend_surprise != nullptr);
+            GGML_ASSERT((size_t) (n_outputs_prev + n_outputs) <= ais_surprise.size());
+            ggml_backend_tensor_get_async(backend_surprise, t_surprise,
+                    ais_surprise.data() + n_outputs_prev, 0, n_outputs*sizeof(float));
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -1910,6 +1951,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size = has_logits ? n_vocab*n_outputs_max : 0;
     embd.size   = has_embd ? n_embd_out*n_outputs_max : 0;
+
+    // AIS gather-dot: one float per output row (negligible; own backing memory). Sized
+    // unconditionally — the dedicated surprise output runs with embeddings OFF (no embd buffer).
+    ais_surprise.assign(n_outputs_max, 0.0f);
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
@@ -2032,6 +2077,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd.data[i0*n_embd + k], embd.data[i1*n_embd + k]);
             }
+        }
+
+        if (i0 < ais_surprise.size() && i1 < ais_surprise.size()) {
+            std::swap(ais_surprise[i0], ais_surprise[i1]);
         }
 
         if (!sampling.samplers.empty()) {
@@ -3079,6 +3128,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
 
+void llama_set_eval_callback(llama_context * ctx, ggml_backend_sched_eval_callback cb, void * user_data) {
+    ctx->set_eval_callback(cb, user_data);
+}
+
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
 }
@@ -3123,6 +3176,12 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+float llama_get_ais_surprise_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_ais_surprise_ith(i);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
@@ -3238,6 +3297,19 @@ bool llama_memory_seq_rm(
     }
 
     return mem->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_seq_rm_mask(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+        const int8_t * keep,
+              uint32_t n) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->seq_rm_mask(seq_id, p0, keep, n);
 }
 
 void llama_memory_seq_cp(

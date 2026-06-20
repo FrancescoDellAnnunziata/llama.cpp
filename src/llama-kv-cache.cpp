@@ -402,6 +402,60 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     return true;
 }
 
+bool llama_kv_cache::seq_rm_mask(llama_seq_id seq_id, llama_pos p0, const int8_t * keep, uint32_t n) {
+    GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+
+    if (p0 < 0) {
+        p0 = 0;
+    }
+
+    const llama_pos p1 = p0 + (llama_pos) n;
+
+    // single cell scan: drop every cell whose position falls in [p0, p1) and is not kept.
+    // O(n_cells) total instead of O(R·n_cells) for R run-wise seq_rm calls.
+    auto scan = [&](uint32_t s, llama_seq_id sid) {
+        auto & cells = v_cells[s];
+        auto & head  = v_heads[s];
+
+        uint32_t new_head = cells.size();
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.pos_in(i, p0, p1)) {
+                continue;
+            }
+            if (keep[cells.pos_get(i) - p0]) {
+                continue;   // position retained
+            }
+
+            bool removed;
+            if (sid >= 0) {
+                removed = cells.seq_has(i, sid) && cells.seq_rm(i, sid);
+            } else {
+                cells.rm(i);
+                removed = true;
+            }
+
+            if (removed && new_head == cells.size()) {
+                new_head = i;
+            }
+        }
+
+        if (new_head != cells.size() && new_head < head) {
+            head = new_head;
+        }
+    };
+
+    if (seq_id >= 0) {
+        scan(seq_to_stream[seq_id], seq_id);
+    } else {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            scan(s, -1);
+        }
+    }
+
+    return true;
+}
+
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());

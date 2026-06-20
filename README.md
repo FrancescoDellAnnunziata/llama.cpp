@@ -1,596 +1,389 @@
-# llama.cpp
+# AIS OMNI — Adaptive Ingestion System for llama.cpp
 
-![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
+**A model-agnostic KV-cache compression layer for [llama.cpp](https://github.com/ggerganov/llama.cpp).
+One flag. It filters low-information / redundant context before and inside the forward pass —
+equal to vanilla when there's nothing to gain, much faster on the redundant context real coding
+agents produce, lighter on RAM, and at zero quality cost.**
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
+**Works on every standard-attention model** (Gemma, Qwen, Llama, Mistral, …) through a single
+flash-attention hook — no per-model porting. And if you already run llama.cpp it's **dead simple**:
+build one target, set one env var, point your client at `:8080/v1`. That's the whole setup.
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
+Point any OpenAI-compatible client (Cline, Continue, your own app) at `http://localhost:8080/v1`.
 
-LLM inference in C/C++
-
-## Recent API changes
-
-- [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
-- [Changelog for `llama-server` REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
-
-## Hot topics
-
-- **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
-- **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
-- [guide : running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
-- [[FEEDBACK] Better packaging for llama.cpp to support downstream consumers 🤗](https://github.com/ggml-org/llama.cpp/discussions/15313)
-- Support for the `gpt-oss` model with native MXFP4 format has been added | [PR](https://github.com/ggml-org/llama.cpp/pull/15091) | [Collaboration with NVIDIA](https://blogs.nvidia.com/blog/rtx-ai-garage-openai-oss) | [Comment](https://github.com/ggml-org/llama.cpp/discussions/15095)
-- Multimodal support arrived in `llama-server`: [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) | [documentation](./docs/multimodal.md)
-- VS Code extension for FIM completions: https://github.com/ggml-org/llama.vscode
-- Vim/Neovim plugin for FIM completions: https://github.com/ggml-org/llama.vim
-- Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669
-- Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
-
-----
-
-## Quick start
-
-Getting started with llama.cpp is straightforward. Here are several ways to install it on your machine:
-
-- Install `llama.cpp` using [brew, nix or winget](docs/install.md)
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
-
-Once installed, you'll need a model to work with. Head to the [Obtaining and quantizing models](#obtaining-and-quantizing-models) section to learn more.
-
-Example command:
-
-```sh
-# Use a local model file
-llama-cli -m my_model.gguf
-
-# Or download and run a model directly from Hugging Face
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
-
-# Launch OpenAI-compatible API server
-llama-server -hf ggml-org/gemma-3-1b-it-GGUF
-```
-
-## Description
-
-The main goal of `llama.cpp` is to enable LLM inference with minimal setup and state-of-the-art performance on a wide
-range of hardware - locally and in the cloud.
-
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
-
-The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
-
-<details>
-<summary>Models</summary>
-
-Typically finetunes of the base models below are supported as well.
-
-Instructions for adding support for new models: [HOWTO-add-model.md](docs/development/HOWTO-add-model.md)
-
-#### Text-only
-
-- [X] LLaMA 🦙
-- [x] LLaMA 2 🦙🦙
-- [x] LLaMA 3 🦙🦙🦙
-- [X] [Mistral 7B](https://huggingface.co/mistralai/Mistral-7B-v0.1)
-- [x] [Mixtral MoE](https://huggingface.co/models?search=mistral-ai/Mixtral)
-- [x] [DBRX](https://huggingface.co/databricks/dbrx-instruct)
-- [x] [Jamba](https://huggingface.co/ai21labs)
-- [X] [Falcon](https://huggingface.co/models?search=tiiuae/falcon)
-- [X] [Chinese LLaMA / Alpaca](https://github.com/ymcui/Chinese-LLaMA-Alpaca) and [Chinese LLaMA-2 / Alpaca-2](https://github.com/ymcui/Chinese-LLaMA-Alpaca-2)
-- [X] [Vigogne (French)](https://github.com/bofenghuang/vigogne)
-- [X] [BERT](https://github.com/ggml-org/llama.cpp/pull/5423)
-- [X] [Koala](https://bair.berkeley.edu/blog/2023/04/03/koala/)
-- [X] [Baichuan 1 & 2](https://huggingface.co/models?search=baichuan-inc/Baichuan) + [derivations](https://huggingface.co/hiyouga/baichuan-7b-sft)
-- [X] [Aquila 1 & 2](https://huggingface.co/models?search=BAAI/Aquila)
-- [X] [Starcoder models](https://github.com/ggml-org/llama.cpp/pull/3187)
-- [X] [Refact](https://huggingface.co/smallcloudai/Refact-1_6B-fim)
-- [X] [MPT](https://github.com/ggml-org/llama.cpp/pull/3417)
-- [X] [Bloom](https://github.com/ggml-org/llama.cpp/pull/3553)
-- [x] [Yi models](https://huggingface.co/models?search=01-ai/Yi)
-- [X] [StableLM models](https://huggingface.co/stabilityai)
-- [x] [Deepseek models](https://huggingface.co/models?search=deepseek-ai/deepseek)
-- [x] [Qwen models](https://huggingface.co/models?search=Qwen/Qwen)
-- [x] [PLaMo-13B](https://github.com/ggml-org/llama.cpp/pull/3557)
-- [x] [Phi models](https://huggingface.co/models?search=microsoft/phi)
-- [x] [PhiMoE](https://github.com/ggml-org/llama.cpp/pull/11003)
-- [x] [GPT-2](https://huggingface.co/gpt2)
-- [x] [Orion 14B](https://github.com/ggml-org/llama.cpp/pull/5118)
-- [x] [InternLM2](https://huggingface.co/models?search=internlm2)
-- [x] [CodeShell](https://github.com/WisdomShell/codeshell)
-- [x] [Gemma](https://ai.google.dev/gemma)
-- [x] [Mamba](https://github.com/state-spaces/mamba)
-- [x] [Grok-1](https://huggingface.co/keyfan/grok-1-hf)
-- [x] [Xverse](https://huggingface.co/models?search=xverse)
-- [x] [Command-R models](https://huggingface.co/models?search=CohereForAI/c4ai-command-r)
-- [x] [SEA-LION](https://huggingface.co/models?search=sea-lion)
-- [x] [GritLM-7B](https://huggingface.co/GritLM/GritLM-7B) + [GritLM-8x7B](https://huggingface.co/GritLM/GritLM-8x7B)
-- [x] [OLMo](https://allenai.org/olmo)
-- [x] [OLMo 2](https://allenai.org/olmo)
-- [x] [OLMoE](https://huggingface.co/allenai/OLMoE-1B-7B-0924)
-- [x] [Granite models](https://huggingface.co/collections/ibm-granite/granite-code-models-6624c5cec322e4c148c8b330)
-- [x] [GPT-NeoX](https://github.com/EleutherAI/gpt-neox) + [Pythia](https://github.com/EleutherAI/pythia)
-- [x] [Snowflake-Arctic MoE](https://huggingface.co/collections/Snowflake/arctic-66290090abe542894a5ac520)
-- [x] [Smaug](https://huggingface.co/models?search=Smaug)
-- [x] [Poro 34B](https://huggingface.co/LumiOpen/Poro-34B)
-- [x] [Bitnet b1.58 models](https://huggingface.co/1bitLLM)
-- [x] [Flan T5](https://huggingface.co/models?search=flan-t5)
-- [x] [Open Elm models](https://huggingface.co/collections/apple/openelm-instruct-models-6619ad295d7ae9f868b759ca)
-- [x] [ChatGLM3-6b](https://huggingface.co/THUDM/chatglm3-6b) + [ChatGLM4-9b](https://huggingface.co/THUDM/glm-4-9b) + [GLMEdge-1.5b](https://huggingface.co/THUDM/glm-edge-1.5b-chat) + [GLMEdge-4b](https://huggingface.co/THUDM/glm-edge-4b-chat)
-- [x] [GLM-4-0414](https://huggingface.co/collections/THUDM/glm-4-0414-67f3cbcb34dd9d252707cb2e)
-- [x] [SmolLM](https://huggingface.co/collections/HuggingFaceTB/smollm-6695016cad7167254ce15966)
-- [x] [EXAONE-3.0-7.8B-Instruct](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct)
-- [x] [FalconMamba Models](https://huggingface.co/collections/tiiuae/falconmamba-7b-66b9a580324dd1598b0f6d4a)
-- [x] [Jais](https://huggingface.co/inceptionai/jais-13b-chat)
-- [x] [Bielik-11B-v2.3](https://huggingface.co/collections/speakleash/bielik-11b-v23-66ee813238d9b526a072408a)
-- [x] [RWKV-7](https://huggingface.co/collections/shoumenchougou/rwkv7-gxx-gguf)
-- [x] [RWKV-6](https://github.com/BlinkDL/RWKV-LM)
-- [x] [QRWKV-6](https://huggingface.co/recursal/QRWKV6-32B-Instruct-Preview-v0.1)
-- [x] [GigaChat-20B-A3B](https://huggingface.co/ai-sage/GigaChat-20B-A3B-instruct)
-- [X] [Trillion-7B-preview](https://huggingface.co/trillionlabs/Trillion-7B-preview)
-- [x] [Ling models](https://huggingface.co/collections/inclusionAI/ling-67c51c85b34a7ea0aba94c32)
-- [x] [LFM2 models](https://huggingface.co/collections/LiquidAI/lfm2-686d721927015b2ad73eaa38)
-- [x] [Hunyuan models](https://huggingface.co/collections/tencent/hunyuan-dense-model-6890632cda26b19119c9c5e7)
-- [x] [BailingMoeV2 (Ring/Ling 2.0) models](https://huggingface.co/collections/inclusionAI/ling-v2-68bf1dd2fc34c306c1fa6f86)
-
-#### Multimodal
-
-- [x] [LLaVA 1.5 models](https://huggingface.co/collections/liuhaotian/llava-15-653aac15d994e992e2677a7e), [LLaVA 1.6 models](https://huggingface.co/collections/liuhaotian/llava-16-65b9e40155f60fd046a5ccf2)
-- [x] [BakLLaVA](https://huggingface.co/models?search=SkunkworksAI/Bakllava)
-- [x] [Obsidian](https://huggingface.co/NousResearch/Obsidian-3B-V0.5)
-- [x] [ShareGPT4V](https://huggingface.co/models?search=Lin-Chen/ShareGPT4V)
-- [x] [MobileVLM 1.7B/3B models](https://huggingface.co/models?search=mobileVLM)
-- [x] [Yi-VL](https://huggingface.co/models?search=Yi-VL)
-- [x] [Mini CPM](https://huggingface.co/models?search=MiniCPM)
-- [x] [Moondream](https://huggingface.co/vikhyatk/moondream2)
-- [x] [Bunny](https://github.com/BAAI-DCAI/Bunny)
-- [x] [GLM-EDGE](https://huggingface.co/models?search=glm-edge)
-- [x] [Qwen2-VL](https://huggingface.co/collections/Qwen/qwen2-vl-66cee7455501d7126940800d)
-- [x] [LFM2-VL](https://huggingface.co/collections/LiquidAI/lfm2-vl-68963bbc84a610f7638d5ffa)
-
-</details>
-
-<details>
-<summary>Bindings</summary>
-
-- Python: [ddh0/easy-llama](https://github.com/ddh0/easy-llama)
-- Python: [abetlen/llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
-- Go: [go-skynet/go-llama.cpp](https://github.com/go-skynet/go-llama.cpp)
-- Node.js: [withcatai/node-llama-cpp](https://github.com/withcatai/node-llama-cpp)
-- JS/TS (llama.cpp server client): [lgrammel/modelfusion](https://modelfusion.dev/integration/model-provider/llamacpp)
-- JS/TS (Programmable Prompt Engine CLI): [offline-ai/cli](https://github.com/offline-ai/cli)
-- JavaScript/Wasm (works in browser): [tangledgroup/llama-cpp-wasm](https://github.com/tangledgroup/llama-cpp-wasm)
-- Typescript/Wasm (nicer API, available on npm): [ngxson/wllama](https://github.com/ngxson/wllama)
-- Ruby: [yoshoku/llama_cpp.rb](https://github.com/yoshoku/llama_cpp.rb)
-- Rust (more features): [edgenai/llama_cpp-rs](https://github.com/edgenai/llama_cpp-rs)
-- Rust (nicer API): [mdrokz/rust-llama.cpp](https://github.com/mdrokz/rust-llama.cpp)
-- Rust (more direct bindings): [utilityai/llama-cpp-rs](https://github.com/utilityai/llama-cpp-rs)
-- Rust (automated build from crates.io): [ShelbyJenkins/llm_client](https://github.com/ShelbyJenkins/llm_client)
-- C#/.NET: [SciSharp/LLamaSharp](https://github.com/SciSharp/LLamaSharp)
-- C#/VB.NET (more features - community license): [LM-Kit.NET](https://docs.lm-kit.com/lm-kit-net/index.html)
-- Scala 3: [donderom/llm4s](https://github.com/donderom/llm4s)
-- Clojure: [phronmophobic/llama.clj](https://github.com/phronmophobic/llama.clj)
-- React Native: [mybigday/llama.rn](https://github.com/mybigday/llama.rn)
-- Java: [kherud/java-llama.cpp](https://github.com/kherud/java-llama.cpp)
-- Java: [QuasarByte/llama-cpp-jna](https://github.com/QuasarByte/llama-cpp-jna)
-- Zig: [deins/llama.cpp.zig](https://github.com/Deins/llama.cpp.zig)
-- Flutter/Dart: [netdur/llama_cpp_dart](https://github.com/netdur/llama_cpp_dart)
-- Flutter: [xuegao-tzx/Fllama](https://github.com/xuegao-tzx/Fllama)
-- PHP (API bindings and features built on top of llama.cpp): [distantmagic/resonance](https://github.com/distantmagic/resonance) [(more info)](https://github.com/ggml-org/llama.cpp/pull/6326)
-- Guile Scheme: [guile_llama_cpp](https://savannah.nongnu.org/projects/guile-llama-cpp)
-- Swift [srgtuszy/llama-cpp-swift](https://github.com/srgtuszy/llama-cpp-swift)
-- Swift [ShenghaiWang/SwiftLlama](https://github.com/ShenghaiWang/SwiftLlama)
-- Delphi [Embarcadero/llama-cpp-delphi](https://github.com/Embarcadero/llama-cpp-delphi)
-- Go (no CGo needed): [hybridgroup/yzma](https://github.com/hybridgroup/yzma)
-- Android: [llama.android](/examples/llama.android)
-
-</details>
-
-<details>
-<summary>UIs</summary>
-
-*(to have a project listed here, it should clearly state that it depends on `llama.cpp`)*
-
-- [AI Sublime Text plugin](https://github.com/yaroslavyaroslav/OpenAI-sublime-text) (MIT)
-- [BonzAI App](https://apps.apple.com/us/app/bonzai-your-local-ai-agent/id6752847988) (proprietary)
-- [cztomsik/ava](https://github.com/cztomsik/ava) (MIT)
-- [Dot](https://github.com/alexpinel/Dot) (GPL)
-- [eva](https://github.com/ylsdamxssjxxdd/eva) (MIT)
-- [iohub/collama](https://github.com/iohub/coLLaMA) (Apache-2.0)
-- [janhq/jan](https://github.com/janhq/jan) (AGPL)
-- [johnbean393/Sidekick](https://github.com/johnbean393/Sidekick) (MIT)
-- [KanTV](https://github.com/zhouwg/kantv?tab=readme-ov-file) (Apache-2.0)
-- [KodiBot](https://github.com/firatkiral/kodibot) (GPL)
-- [llama.vim](https://github.com/ggml-org/llama.vim) (MIT)
-- [LARS](https://github.com/abgulati/LARS) (AGPL)
-- [Llama Assistant](https://github.com/vietanhdev/llama-assistant) (GPL)
-- [LlamaLib](https://github.com/undreamai/LlamaLib) (Apache-2.0)
-- [LLMFarm](https://github.com/guinmoon/LLMFarm?tab=readme-ov-file) (MIT)
-- [LLMUnity](https://github.com/undreamai/LLMUnity) (MIT)
-- [LMStudio](https://lmstudio.ai/) (proprietary)
-- [LocalAI](https://github.com/mudler/LocalAI) (MIT)
-- [LostRuins/koboldcpp](https://github.com/LostRuins/koboldcpp) (AGPL)
-- [MindMac](https://mindmac.app) (proprietary)
-- [MindWorkAI/AI-Studio](https://github.com/MindWorkAI/AI-Studio) (FSL-1.1-MIT)
-- [Mobile-Artificial-Intelligence/maid](https://github.com/Mobile-Artificial-Intelligence/maid) (MIT)
-- [Mozilla-Ocho/llamafile](https://github.com/Mozilla-Ocho/llamafile) (Apache-2.0)
-- [nat/openplayground](https://github.com/nat/openplayground) (MIT)
-- [nomic-ai/gpt4all](https://github.com/nomic-ai/gpt4all) (MIT)
-- [ollama/ollama](https://github.com/ollama/ollama) (MIT)
-- [oobabooga/text-generation-webui](https://github.com/oobabooga/text-generation-webui) (AGPL)
-- [PocketPal AI](https://github.com/a-ghorbani/pocketpal-ai) (MIT)
-- [psugihara/FreeChat](https://github.com/psugihara/FreeChat) (MIT)
-- [ptsochantaris/emeltal](https://github.com/ptsochantaris/emeltal) (MIT)
-- [pythops/tenere](https://github.com/pythops/tenere) (AGPL)
-- [ramalama](https://github.com/containers/ramalama) (MIT)
-- [semperai/amica](https://github.com/semperai/amica) (MIT)
-- [withcatai/catai](https://github.com/withcatai/catai) (MIT)
-- [Autopen](https://github.com/blackhole89/autopen) (GPL)
-
-</details>
-
-<details>
-<summary>Tools</summary>
-
-- [akx/ggify](https://github.com/akx/ggify) – download PyTorch models from Hugging Face Hub and convert them to GGML
-- [akx/ollama-dl](https://github.com/akx/ollama-dl) – download models from the Ollama library to be used directly with llama.cpp
-- [crashr/gppm](https://github.com/crashr/gppm) – launch llama.cpp instances utilizing NVIDIA Tesla P40 or P100 GPUs with reduced idle power consumption
-- [gpustack/gguf-parser](https://github.com/gpustack/gguf-parser-go/tree/main/cmd/gguf-parser) - review/check the GGUF file and estimate the memory usage
-- [Styled Lines](https://marketplace.unity.com/packages/tools/generative-ai/styled-lines-llama-cpp-model-292902) (proprietary licensed, async wrapper of inference part for game development in Unity3d with pre-built Mobile and Web platform wrappers and a model example)
-- [unslothai/unsloth](https://github.com/unslothai/unsloth) – 🦥 exports/saves fine-tuned and trained models to GGUF (Apache-2.0)
-
-</details>
-
-<details>
-<summary>Infrastructure</summary>
-
-- [Paddler](https://github.com/intentee/paddler) - Open-source LLMOps platform for hosting and scaling AI in your own infrastructure
-- [GPUStack](https://github.com/gpustack/gpustack) - Manage GPU clusters for running LLMs
-- [llama_cpp_canister](https://github.com/onicai/llama_cpp_canister) - llama.cpp as a smart contract on the Internet Computer, using WebAssembly
-- [llama-swap](https://github.com/mostlygeek/llama-swap) - transparent proxy that adds automatic model switching with llama-server
-- [Kalavai](https://github.com/kalavai-net/kalavai-client) - Crowdsource end to end LLM deployment at any scale
-- [llmaz](https://github.com/InftyAI/llmaz) - ☸️ Easy, advanced inference platform for large language models on Kubernetes.
-- [LLMKube](https://github.com/defilantech/llmkube) - Kubernetes operator for llama.cpp with multi-GPU and Apple Silicon Metal
-  support"
-</details>
-
-<details>
-<summary>Games</summary>
-
-- [Lucy's Labyrinth](https://github.com/MorganRO8/Lucys_Labyrinth) - A simple maze game where agents controlled by an AI model will try to trick you.
-
-</details>
-
-
-## Supported backends
-
-| Backend | Target devices |
-| --- | --- |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel and Nvidia GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [WebGPU [In Progress]](docs/build.md#webgpu) | All |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-
-## Obtaining and quantizing models
-
-The [Hugging Face](https://huggingface.co) platform hosts a [number of LLMs](https://huggingface.co/models?library=gguf&sort=trending) compatible with `llama.cpp`:
-
-- [Trending](https://huggingface.co/models?library=gguf&sort=trending)
-- [LLaMA](https://huggingface.co/models?sort=trending&search=llama+gguf)
-
-You can either manually download the GGUF file or directly use any `llama.cpp`-compatible models from [Hugging Face](https://huggingface.co/) or other model hosting sites, by using this CLI argument: `-hf <user>/<model>[:quant]`. For example:
-
-```sh
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
-```
-
-By default, the CLI would download from Hugging Face, you can switch to other options with the environment variable `MODEL_ENDPOINT`. The `MODEL_ENDPOINT` must point to a Hugging Face compatible API endpoint.
-
-After downloading a model, use the CLI tools to run it locally - see below.
-
-`llama.cpp` requires the model to be stored in the [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) file format. Models in other data formats can be converted to GGUF using the `convert_*.py` Python scripts in this repo.
-
-The Hugging Face platform provides a variety of online tools for converting, quantizing and hosting models with `llama.cpp`:
-
-- Use the [GGUF-my-repo space](https://huggingface.co/spaces/ggml-org/gguf-my-repo) to convert to GGUF format and quantize model weights to smaller sizes
-- Use the [GGUF-my-LoRA space](https://huggingface.co/spaces/ggml-org/gguf-my-lora) to convert LoRA adapters to GGUF format (more info: https://github.com/ggml-org/llama.cpp/discussions/10123)
-- Use the [GGUF-editor space](https://huggingface.co/spaces/CISCai/gguf-editor) to edit GGUF meta data in the browser (more info: https://github.com/ggml-org/llama.cpp/discussions/9268)
-- Use the [Inference Endpoints](https://ui.endpoints.huggingface.co/) to directly host `llama.cpp` in the cloud (more info: https://github.com/ggml-org/llama.cpp/discussions/9669)
-
-To learn more about model quantization, [read this documentation](tools/quantize/README.md)
-
-## [`llama-cli`](tools/cli)
-
-#### A CLI tool for accessing and experimenting with most of `llama.cpp`'s functionality.
-
-- <details open>
-    <summary>Run in conversation mode</summary>
-
-    Models with a built-in chat template will automatically activate conversation mode. If this doesn't occur, you can manually enable it by adding `-cnv` and specifying a suitable chat template with `--chat-template NAME`
-
-    ```bash
-    llama-cli -m model.gguf
-
-    # > hi, who are you?
-    # Hi there! I'm your helpful assistant! I'm an AI-powered chatbot designed to assist and provide information to users like you. I'm here to help answer your questions, provide guidance, and offer support on a wide range of topics. I'm a friendly and knowledgeable AI, and I'm always happy to help with anything you need. What's on your mind, and how can I assist you today?
-    #
-    # > what is 1+1?
-    # Easy peasy! The answer to 1+1 is... 2!
-    ```
-
-    </details>
-
-- <details>
-    <summary>Run in conversation mode with custom chat template</summary>
-
-    ```bash
-    # use the "chatml" template (use -h to see the list of supported templates)
-    llama-cli -m model.gguf -cnv --chat-template chatml
-
-    # use a custom template
-    llama-cli -m model.gguf -cnv --in-prefix 'User: ' --reverse-prompt 'User:'
-    ```
-
-    </details>
-
-- <details>
-    <summary>Constrain the output with a custom grammar</summary>
-
-    ```bash
-    llama-cli -m model.gguf -n 256 --grammar-file grammars/json.gbnf -p 'Request: schedule a call at 8pm; Command:'
-
-    # {"appointmentTime": "8pm", "appointmentDetails": "schedule a a call"}
-    ```
-
-    The [grammars/](grammars/) folder contains a handful of sample grammars. To write your own, check out the [GBNF Guide](grammars/README.md).
-
-    For authoring more complex JSON grammars, check out https://grammar.intrinsiclabs.ai/
-
-    </details>
-
-
-## [`llama-server`](tools/server)
-
-#### A lightweight, [OpenAI API](https://github.com/openai/openai-openapi) compatible, HTTP server for serving LLMs.
-
-- <details open>
-    <summary>Start a local HTTP server with default configuration on port 8080</summary>
-
-    ```bash
-    llama-server -m model.gguf --port 8080
-
-    # Basic web UI can be accessed via browser: http://localhost:8080
-    # Chat completion endpoint: http://localhost:8080/v1/chat/completions
-    ```
-
-    </details>
-
-- <details>
-    <summary>Support multiple-users and parallel decoding</summary>
-
-    ```bash
-    # up to 4 concurrent requests, each with 4096 max context
-    llama-server -m model.gguf -c 16384 -np 4
-    ```
-
-    </details>
-
-- <details>
-    <summary>Enable speculative decoding</summary>
-
-    ```bash
-    # the draft.gguf model should be a small variant of the target model.gguf
-    llama-server -m model.gguf -md draft.gguf
-    ```
-
-    </details>
-
-- <details>
-    <summary>Serve an embedding model</summary>
-
-    ```bash
-    # use the /embedding endpoint
-    llama-server -m model.gguf --embedding --pooling cls -ub 8192
-    ```
-
-    </details>
-
-- <details>
-    <summary>Serve a reranking model</summary>
-
-    ```bash
-    # use the /reranking endpoint
-    llama-server -m model.gguf --reranking
-    ```
-
-    </details>
-
-- <details>
-    <summary>Constrain all outputs with a grammar</summary>
-
-    ```bash
-    # custom grammar
-    llama-server -m model.gguf --grammar-file grammar.gbnf
-
-    # JSON
-    llama-server -m model.gguf --grammar-file grammars/json.gbnf
-    ```
-
-    </details>
-
-
-## [`llama-perplexity`](tools/perplexity)
-
-#### A tool for measuring the [perplexity](tools/perplexity/README.md) [^1] (and other quality metrics) of a model over a given text.
-
-- <details open>
-    <summary>Measure the perplexity over a text file</summary>
-
-    ```bash
-    llama-perplexity -m model.gguf -f file.txt
-
-    # [1]15.2701,[2]5.4007,[3]5.3073,[4]6.2965,[5]5.8940,[6]5.6096,[7]5.7942,[8]4.9297, ...
-    # Final estimate: PPL = 5.4007 +/- 0.67339
-    ```
-
-    </details>
-
-- <details>
-    <summary>Measure KL divergence</summary>
-
-    ```bash
-    # TODO
-    ```
-
-    </details>
-
-[^1]: [https://huggingface.co/docs/transformers/perplexity](https://huggingface.co/docs/transformers/perplexity)
-
-## [`llama-bench`](tools/llama-bench)
-
-#### Benchmark the performance of the inference for various parameters.
-
-- <details open>
-    <summary>Run default benchmark</summary>
-
-    ```bash
-    llama-bench -m model.gguf
-
-    # Output:
-    # | model               |       size |     params | backend    | threads |          test |                  t/s |
-    # | ------------------- | ---------: | ---------: | ---------- | ------: | ------------: | -------------------: |
-    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         pp512 |      5765.41 ± 20.55 |
-    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         tg128 |        197.71 ± 0.81 |
-    #
-    # build: 3e0ba0e60 (4229)
-    ```
-
-    </details>
-
-## [`llama-simple`](examples/simple)
-
-#### A minimal example for implementing apps with `llama.cpp`. Useful for developers.
-
-- <details>
-    <summary>Basic text completion</summary>
-
-    ```bash
-    llama-simple -m model.gguf
-
-    # Hello my name is Kaitlyn and I am a 16 year old girl. I am a junior in high school and I am currently taking a class called "The Art of
-    ```
-
-    </details>
-
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- See [good first issues](https://github.com/ggml-org/llama.cpp/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) for tasks suitable for first contributions
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-- Make sure to read this: [Inference at the edge](https://github.com/ggml-org/llama.cpp/discussions/205)
-- A bit of backstory for those who are interested: [Changelog podcast](https://changelog.com/podcast/532)
-
-## Other documentation
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development documentation
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-
-#### Seminal papers and background on the models
-
-If your issue is with model generation quality, then please at least scan the following links and papers to understand the limitations of LLaMA models. This is especially important when choosing an appropriate model size and appreciating both the significant and subtle differences between LLaMA models and ChatGPT:
-- LLaMA:
-    - [Introducing LLaMA: A foundational, 65-billion-parameter large language model](https://ai.facebook.com/blog/large-language-model-llama-meta-ai/)
-    - [LLaMA: Open and Efficient Foundation Language Models](https://arxiv.org/abs/2302.13971)
-- GPT-3
-    - [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165)
-- GPT-3.5 / InstructGPT / ChatGPT:
-    - [Aligning language models to follow instructions](https://openai.com/research/instruction-following)
-    - [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
-
-## XCFramework
-The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
-and macOS. It can be used in Swift projects without the need to compile the
-library from source. For example:
-```swift
-// swift-tools-version: 5.10
-// The swift-tools-version declares the minimum version of Swift required to build this package.
-
-import PackageDescription
-
-let package = Package(
-    name: "MyLlamaPackage",
-    targets: [
-        .executableTarget(
-            name: "MyLlamaPackage",
-            dependencies: [
-                "LlamaFramework"
-            ]),
-        .binaryTarget(
-            name: "LlamaFramework",
-            url: "https://github.com/ggml-org/llama.cpp/releases/download/b5046/llama-b5046-xcframework.zip",
-            checksum: "c19be78b5f00d8d29a25da41042cb7afa094cbf6280a225abe614b03b20029ab"
-        )
-    ]
-)
-```
-The above example is using an intermediate build `b5046` of the library. This can be modified
-to use a different version by changing the URL and checksum.
-
-## Completions
-Command-line completion is available for some environments.
-
-#### Bash Completion
 ```bash
-$ build/bin/llama-cli --completion-bash > ~/.llama-completion.bash
-$ source ~/.llama-completion.bash
-```
-Optionally this can be added to your `.bashrc` or `.bash_profile` to load it
-automatically. For example:
-```console
-$ echo "source ~/.llama-completion.bash" >> ~/.bashrc
+AIS_OMNI=1 build/bin/ais_prob "$MODEL" 0.7 sigma-mk --server 8080 --host 0.0.0.0 --ctx 16384
+# or simply:  bash ais/start_omni.sh /path/to/model.gguf
 ```
 
-## Dependencies
+`AIS_OMNI` is **streaming-native** (the path Cline and OpenAI clients actually use) and works on
+**every standard-attention model via one FA hook** — Gemma-4, Qwen3, Llama, Mistral, … (no per-model
+graph fork). It bundles SnapKV eviction + dedup pre-gate + multi-turn delta reuse + auto-MASS + a
+KV-bound gate (no tax on short prompts). Chat-safe by default; `AIS_OMNI_CODE` adds a syntax-aware
+lexgate for pure coding, `AIS_SNAPKV_KVQ8=1` halves KV memory.
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+What each piece means:
+
+- **SnapKV eviction** — *query-aware* KV-cache pruning. After prefill, each cached token is scored by
+  how much the recent query window actually attends to it; the low-relevance tokens are dropped from
+  the cache so decode attends to far fewer keys/values (the orange→grey tokens in the animation below).
+  Keep ratio is `AIS_SNAPKV_KEEP` (default 0.4).
+- **dedup pre-gate** — a cheap n-gram check *before* the forward pass that detects repeated or
+  near-duplicate spans (boilerplate, re-pasted files, repeated tool output) and skips re-ingesting
+  them. This runs ahead of attention, so it's what produces the large speedups on redundant input —
+  the model never pays to process the repeats.
+- **multi-turn delta reuse** — across conversation turns the already-compressed prefix is kept and
+  reused; only the *new* part of the prompt (the delta) is processed each turn. In a Cline/agent
+  session the static system+history prefix isn't recompressed every message → cumulative latency
+  separates from vanilla as the chat grows.
+- **auto-MASS** — automatic compression *strength*. Instead of a fixed keep ratio, the router measures
+  the n-gram redundancy of the incoming context and picks how aggressively to compress: dense/unique
+  code → keep almost everything; logs/filler/repetition → compress hard. ("MASS" = the probability
+  mass of attention the kept tokens must cover.) Override with a fixed target via `AIS_SNAPKV_MASS`
+  or a fixed ratio via `AIS_SNAPKV_KEEP`.
+- **KV-bound gate** — compression only engages when decoding is actually *KV-bound*, i.e. the context
+  is long enough that attention over the cache dominates cost. Below the threshold
+  (`AIS_SNAPKV_KVBOUND`, default ~2500 tokens) the router stays out of the way and runs identical to
+  vanilla — that's the "no tax on short prompts": small chats and one-liners aren't slowed down by
+  machinery that can't pay off.
+- **CoT-cut** — (thinking models only; on by default in OMNI, scoped strictly to the *thinking* phase).
+  While the model reasons, each generated token's surprise (−log₂ p) is measured; when the thought goes
+  low-information — a run of 24 consecutive tokens each below 0.05 bit, i.e. the model is just confidently
+  restating itself — the thinking phase is closed early and the model is made to answer. The first 48
+  thinking tokens are always protected and the cut **can never touch the answer or code**. Net: the same
+  answer in ~50 fewer thinking tokens (single-turn dense 0.97×→1.09×); it's a *speed* feature,
+  quality-neutral at a fair budget. Disable with `AIS_COT_OFF=1`. (Full math + where it's active in each
+  plot: ["Under the hood"](#under-the-hood-the-surprise-score-sigma-mk-and-cot-cut) below.)
+
+<details>
+<summary><b>New to the jargon? Every background term, plainly (click to expand)</b></summary>
+
+- **Token** — the unit a model reads and writes, ~¾ of a word. Models process one token at a time.
+- **Context / ctx window** — how many tokens the model can hold at once (e.g. `--ctx 16384`). Bigger = more memory.
+- **Vanilla** — plain `llama.cpp` with AIS off. The baseline everything is compared against.
+- **KV cache** — the model's short-term memory. For every token it has already seen it stores a Key/Value
+  vector so it never recomputes them. It grows with the conversation, eats RAM, and **every new token must
+  attend over all of it** — so a big cache is the thing that makes long sessions slow. Compressing it is the
+  whole point of AIS.
+- **Prefill** — the one-time pass where the model ingests the entire prompt before writing anything. Long
+  prompts → slow, expensive prefill. **Decode** is the after-phase: emitting the answer one token at a time.
+- **Forward pass** — one full run of the model over its input (prefill is a forward pass over the prompt).
+  "Before the forward pass" = work AIS does *without* paying the model's compute — that's why dedup is so cheap.
+- **Attention** — the step where each new token looks back over the KV cache to weigh what's relevant; its cost
+  scales with how many tokens are in the cache. **FFN** (feed-forward network) is the other heavy per-token block.
+- **Flash-attention (FA)** — a faster, lower-memory way to compute attention. AIS's relevance scoring is a small
+  gated **hook inside FA** (`build_attn_mha`), which is why one code path covers every model (no per-model rewrite).
+- **Standard-attention model** — any ordinary transformer (Gemma, Qwen, Llama, Mistral…). AIS works on all of
+  them through that one FA hook.
+- **Streaming vs non-streaming** — streaming sends tokens as they're produced (what Cline and OpenAI clients use);
+  non-streaming returns the whole reply at once. They run through **different server code paths** — the bug we
+  found was that compression only ran in the unused non-streaming path.
+- **n-gram** — a run of N consecutive tokens. Comparing n-grams is the cheap trick the dedup gate uses to spot
+  repeated spans without running the model.
+- **Quantization · KV f16 / KV-q8** — storing numbers at lower precision to save RAM. `f16` = 16-bit KV cache;
+  `q8` (`AIS_SNAPKV_KVQ8=1`) = 8-bit cache → ~half the KV memory for a few % prefill cost.
+- **CoT / chain-of-thought** — a "thinking" model's scratch reasoning before its final answer. **CoT-cut** trims
+  that reasoning once it stops adding information — *only the thinking phase, never the answer or code*.
+- **Needle (needle-in-a-haystack)** — a correctness probe: bury a unique fact in a long context and check the
+  model can quote it back. "needle 4/4" = it recalled the planted value every time, even after compression.
+- **MMLU-Pro** — a hard multiple-choice knowledge/reasoning benchmark. **HumanEval** — a coding benchmark (write a
+  function that passes hidden tests); **pass@1** = solved on the first attempt. **GSM8K** — grade-school math word problems.
+- **Peak RSS** — the most real RAM the process ever held (Resident Set Size). The memory number we report.
+- **Temperature 0** — deterministic decoding (always take the most likely token) so benchmark runs are repeatable.
+- **`sigma-mk` / the `0.7`** — the AIS scoring mode (entropic "surprise") and its threshold in the launch command;
+  leave them as shown unless you're tuning. **lexgate** — the optional syntax-aware filter for pure-coding mode (`AIS_OMNI_CODE`).
+
+</details>
+
+### How it works, in two animations
+
+**1. The concept — a redundant prompt.** Same prompt, side by side: **vanilla keeps every token in the
+KV cache** and attends to all of them; **AIS OMNI evicts the redundant/low-relevance tokens**
+(orange → grey), attends to far fewer, and decodes faster — same answer, fewer tokens. (Hand-drawn to
+make the idea legible.)
+
+![KV cache: vanilla full vs AIS OMNI evicted](ais/img/kv_compare.gif)
+
+**2. The same idea on a real, *dense* prompt — the "do no harm" case.** This is the actual per-token
+keep/evict decision OMNI made on **~9.2k tokens of real documentation**, captured live from the running
+server. Because the content is mostly dense and unique, it **keeps the vast majority** — `6,719 / 9,258`
+tokens (green), evicting only the redundant build-log noise (grey): just **−27%** of the cache, answer
+unchanged. Dense input → barely touched; redundant input (gif 1) → heavily compressed. Same flag, same
+engine — the surprise score decides.
+
+![real eviction on a dense prompt, live capture](ais/img/evict_real.gif)
+
+---
+
+## Benchmark
+
+Vanilla `llama-server` and the AIS engine were **rebuilt from the same source tree** (identical
+inference core). All requests are **streamed** (how real clients call the server). Two
+architecturally different models — **Qwen3VL-8B-Instruct** and **gemma-4-E2B-it**, both routed
+through the FA hook. Apple M4, 32 GB · ctx 16384 · flash-attn on · KV f16 · temperature 0.
+
+| Scenario | Qwen3VL-8B | gemma-4-E2B | What it proves |
+|---|---|---|---|
+| Single-turn, **dense unique** | 0.98× · ✅ | 0.97× · ✅ | **Equality** — within ~3% of vanilla, correct |
+| Single-turn, **redundant**    | **14.3×** · ✅ | **12.1×** · ✅ | **Speed** — dedup skips repeats before the forward pass |
+| **Multi-turn** (5 follow-ups) | **1.42×** | **1.38×** | **Efficiency** — compressed prefix reused across turns |
+| **Peak RSS** (van/AIS/AIS-q8) | 12.4 / 10.5 / 9.5 GB | 5.7 / 5.3 / 5.1 GB | **Memory** — −15% / −23% (Qwen) |
+
+**Validated on the real 26B too** (gemma-4-26B-A4B, thinking-on, f16): redundant **7.4×**,
+multi-turn **1.31×**, single-turn parity, RAM −5%, needle **4/4** — the wins hold on the production
+model, not just the small ones.
+
+![26B](ais/img/omni_26b.png)
+
+<table>
+<tr>
+<td><img src="ais/img/multiturn_qwen.png" width="430"/></td>
+<td><img src="ais/img/memory_qwen.png" width="430"/></td>
+</tr>
+<tr>
+<td align="center"><sub>Multi-turn: cumulative latency separates from turn 1</sub></td>
+<td align="center"><sub>Peak RSS: −15% (f16) / −23% (KV-q8)</sub></td>
+</tr>
+</table>
+
+### Quality — compression must not change the answer
+
+MMLU-Pro + HumanEval, **streamed, compression active**, vanilla vs AIS. The long-context MMLU case
+wraps each question in ~3k tokens of filler so the router actively evicts while answering.
+
+| Benchmark | Qwen3VL-8B (van → AIS) | gemma-4-E2B (van → AIS) |
+|---|---|---|
+| MMLU-Pro | 55.0% → 55.0% | 35.0% → 35.0% |
+| MMLU long-context (compression active) | 80.0% → 80.0% | 40.0% → 40.0% |
+| HumanEval pass@1 | 87.5% → 87.5% | 100% → 100% |
+| HumanEval multi-turn | 87.5% → 87.5% | 87.5% → 75.0%¹ |
+
+**Δ = 0 on 7 of 8 cells.** ¹The one exception — Gemma multi-turn code-refine — is a single failing
+problem at N=8 (6/8 vs 7/8), within noise. Full numbers, methodology and caveats are in the tables above.
+
+**OMNI's code-safe CoT-cut (thinking models) is a SPEED feature — quality-neutral at a fair budget.**
+A thinking model needs room to finish thinking *and* answer; under a tight 512-token budget vanilla
+runs out mid-thought and *looks* like it collapses. Give both a fair 4096-token budget and vanilla
+recovers — and the cut **matches** it (Δ≈0):
+
+| gemma-E2B, thinking on | vanilla @512 | vanilla @4096 (fair) | cut ON @4096 |
+|---|---|---|---|
+| MMLU-Pro | 15% | **62.5%** | 62.5% |
+| HumanEval | 25% | **87.5%** | 100% |
+| code multi-turn | 0% | **100%** | 100% |
+| GSM8K math | 5% | **62.5%** | 62.5% |
+
+In fact the chart shows the cut isn't just neutral — on **HumanEval it scored *higher* with AIS OMNI**
+(87.5% → **100%** at the same fair budget). The likely reason: trimming low-information, rambling
+chain-of-thought removes noise the model would otherwise condition on, so it commits to cleaner code.
+Small N (8 problems), so read it as suggestive, not proof — but it's a real "compression helped" data point.
+
+![CoT-cut: a real speed win (left); quality-neutral at a fair budget (right)](ais/img/cotcut.png)
+
+The cut's real value is **speed**: an `AIS_COT_OFF=1` ablation shows single-turn dense is 0.97× (parity)
+with the cut off and **1.09×** with it on — it reaches the same answer in ~50 fewer thinking tokens.
+(The "rescue" numbers some earlier drafts showed were a 512-token budget artifact, not a quality lift.
+The 26B does ramble past even 4096 tokens, so there the cut is what lets it answer within a practical
+budget — but the small-model test above is the clean apples-to-apples one.)
+
+---
+
+## Get started (from zero, ~5 commands)
+
+### 1. Clone
+
+```bash
+git clone <YOUR_FORK_URL> && cd llama.cpp     # this repo (fork of llama.cpp)
+```
+
+### 2. Compile
+
+**Prerequisites:** `cmake ≥ 3.14`, a C++17 compiler, `git`.
+- macOS: `xcode-select --install` (Xcode CLT). · Linux: `sudo apt install build-essential cmake`.
+- Windows: Visual Studio 2022 (Desktop C++) + CMake, or use **w64devkit**/MSYS2.
+
+**Configure for your backend** (pick ONE):
+
+| Platform / GPU | Configure command |
+|---|---|
+| **Apple Silicon (Metal)** | `cmake -B build -DLLAMA_METAL=ON` |
+| **NVIDIA (CUDA)** | `cmake -B build -DGGML_CUDA=ON` |
+| **AMD (ROCm/HIP)** | `cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100` *(set your arch)* |
+| **Vulkan (any GPU)** | `cmake -B build -DGGML_VULKAN=ON` |
+| **Intel GPU (SYCL)** | `source /opt/intel/oneapi/setvars.sh && cmake -B build -DGGML_SYCL=ON` |
+| **CPU only** | `cmake -B build` |
+
+**Build** (the AIS engine + a fair vanilla baseline):
+
+```bash
+# parallel build job count: macOS -> sysctl -n hw.logicalcpu ; Linux -> nproc
+cmake --build build --target ais_prob llama-server -j$(getconf _NPROCESSORS_ONLN)
+```
+
+Produces `build/bin/ais_prob` (AIS) and `build/bin/llama-server` (vanilla baseline).
+On Windows the binaries land in `build/bin/Release/` (add `--config Release` to the build command).
+
+> **GPU offload:** AIS auto-offloads all layers (`-ngl 99` equivalent) where the backend supports it.
+> CPU-only works too (slower). Flash-attention is on by default; the FA relevance hook needs it.
+> Tip: build only what you need — `--target ais_prob` (skip the vanilla baseline) is enough to run.
+
+### 3. Get a model (any standard-attention GGUF)
+
+```bash
+mkdir -p models
+# example — download a small instruct GGUF (or use one you already have):
+curl -L -o models/model.gguf <GGUF_DOWNLOAD_URL>
+```
+
+### 4. Start the server
+
+```bash
+# the easy way — auto-picks the first model in models/ , port 8080, ctx 16384:
+bash ais/start_omni.sh
+
+# or explicit:
+AIS_OMNI=1 build/bin/ais_prob models/model.gguf 0.7 sigma-mk \
+  --server 8080 --host 0.0.0.0 --ctx 16384
+```
+Options: `CODE=1 bash ais/start_omni.sh` (max coding compression) · `KVQ8=1 …` (½ KV memory) ·
+`bash ais/start_omni.sh models/model.gguf 8090 32768` (model, port, ctx).
+
+### 5. Connect / verify
+
+In **Cline / Continue / any OpenAI client**: provider **OpenAI**, Base URL `http://localhost:8080/v1`,
+API key anything (e.g. `sk-local`). Quick check:
+
+```bash
+curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"write a fibonacci function in python"}],"max_tokens":128,"stream":true}'
+```
+
+> Vanilla baseline (for benchmarking): `build/bin/llama-server -m models/model.gguf -c 16384 -ngl 99 -fa 1 --port 8080`
+
+---
+
+## Useful overrides
+
+| Env | Effect | When |
+|---|---|---|
+| `AIS_SNAPKV_KVQ8=1` | KV cache in q8_0 → ½ KV memory, ~+7% prefill | Memory-bound on long context only |
+| `AIS_SNAPKV_KEEP=0.5` | Keep ratio for eviction (default 0.4) | Raise it if deep exact-recall matters |
+| `AIS_SNAPKV_KVBOUND=N` | Router KV-bound threshold (default 2500 tok) | Below N, compression is skipped (no tax on short prompts) |
+| `AIS_COT_OFF=1` | Disable the (code-safe) CoT-cut | If you don't want reasoning compressed |
+| `--ctx 32768` | Larger context | Long Cline sessions |
+
+The router engages **only when it pays**: redundant content → dedup; long context → eviction (only
+if decode is KV-bound); multi-turn → delta reuse. When no axis pays, it stays vanilla-fast.
+
+---
+
+## Under the hood: the surprise score, sigma-mk, and CoT-cut
+
+### The surprise score — what "relevance" actually is
+
+Every token gets a **surprise** value: its information content in bits — how unpredictable it was to
+the model at that position.
+
+```
+s_i  =  −log₂ p(token_i)  =  −log₂ softmax(logits)[token_i]
+```
+
+computed stably as `s_i = −(logit[i] − logZ) / ln2`, with `logZ = m + log Σ_j exp(logit_j − m)` and
+`m = max_j logit_j` (a numerically-safe log-sum-exp). By default AIS uses a cheap **max-margin lower
+bound**, `ŝ_i = (max_j logit_j − logit[i]) / ln2` — O(1) instead of O(vocab), and still in bit units
+(top-K / top-p variants trade speed for fidelity).
+
+Intuition: **high surprise = informative** (a needle, a unique identifier, genuinely new content);
+**low surprise = predictable / redundant** (boilerplate, repeated logs, filler the model could have
+guessed). AIS keeps high-surprise tokens and evicts low-surprise ones — that is the whole relevance signal.
+
+### sigma-mk — the adaptive keep threshold
+
+`sigma-mk` is the scoring mode in `ais_prob "$MODEL" 0.7 sigma-mk`, where **`0.7` = k**. It turns the
+per-token scores into a keep/evict cut derived from the *slice's own* distribution — mean **μ**, std **σ**:
+
+| Slice | Threshold τ | Effect |
+|---|---|---|
+| short (`N < 2000` tok) | — (skip) | no compression, full KV reused — nothing to gain |
+| dense / high-entropy (μ > 2.5 bit) | `τ = max(2.5, μ − k·σ)` | keep most, evict only the least-surprising tail — **code is barely touched** |
+| low-entropy (else) | `τ = max(0.5, μ + k·σ)` | keep only high-surprise outliers, evict the predictable bulk — **logs / filler compress hard** |
+
+Keep token *i* iff `s_i ≥ τ` (or it's an anchor / recent-window / structurally-protected token).
+Lower **k** → more aggressive. That single rule is the content-adaptivity: the *same* flag compresses a
+repetitive log far more than a dense source file, because their surprise distributions differ.
+**auto-MASS** sits on top, picking k / coverage automatically from measured n-gram redundancy.
+
+### CoT-cut — chain-of-thought cut
+
+A **speed** feature for *thinking* models, scoped strictly to the thinking phase. While the model
+reasons, AIS measures each generated token's surprise. When the thought goes low-information — a run of
+**`WIN=24`** consecutive tokens each below **`TLOW=0.05` bit** (the model is just confidently restating
+itself) — AIS closes the thinking phase (emits the end-of-think tag) and makes the model answer. The
+first **`MINT=48`** thinking tokens are always protected, and the cut **can never touch the answer or
+code** — only the reasoning. Optional caps (`AIS_COT_MAXTHINK` / `AIS_COT_MAXTHINK_FRAC`) guarantee
+budget is left for the answer; `AIS_COT_OFF=1` disables it entirely.
+
+Net effect: the same answer in ~50 fewer thinking tokens → single-turn dense **0.97× → 1.09×**. It is
+**quality-neutral at a fair token budget** — the apparent "rescue" in early drafts was a 512-token
+starvation artifact (see the thinking-model table near the top).
+
+#### Where CoT-cut is active in the benchmarks
+
+CoT-cut only does anything when the model is *in a thinking phase*, so it's a no-op on non-thinking runs
+even though it ships inside `AIS_OMNI`:
+
+| Plot / result | CoT-cut | Why |
+|---|---|---|
+| `cotcut.png` | **the subject** (on vs off, @512 vs @4096 budget) | This *is* the CoT-cut experiment |
+| `omni_26b.png` (gemma-4-26B, thinking on) | **active & contributing** | Real thinking phase to trim |
+| speed/memory charts (`multiturn_*`, `memory_*`) | bundled, **not the driver** | Speed here is dedup + eviction; the `AIS_COT_OFF` ablation (0.97×→1.09×) isolates CoT-cut's own single-turn share |
+| quality benchmarks (MMLU-Pro / HumanEval) | active, **scoped to thinking** | Confirms it changes speed, not the answer (Δ≈0) |
+
+---
+
+## Honest caveats
+
+- **Single-turn is parity, not a speedup.** On dense unique input AIS still prefills everything to
+  score relevance, then evicts — the single-turn *speed* win is the redundant case.
+- **`KVQ8` is a memory knob, not a speed knob** — trades ~7%+ prefill for the lowest RAM.
+- **Deep buried-token recall can soften under KEEP=0.4** — a unique value re-asked many turns into a
+  conversation occasionally returns truncated. Not visible at benchmark level (MMLU/HumanEval Δ≈0);
+  tunable via `AIS_SNAPKV_KEEP`/`MINKEEP`.
+- **CoT-cut is a speed feature, quality-neutral at a fair budget.** It compresses the *thinking* phase
+  of thinking models (only while in the thought phase — never truncates the answer/code), reaching the
+  same answer in fewer tokens (single-turn dense 0.97×→**1.09×**). At a fair 4096-token budget vanilla
+  and cut-ON are **Δ≈0** — the "rescue" numbers in earlier drafts were a 512-token starvation artifact.
+  Under a *tight* fixed budget the cut also protects quality (vanilla would run out) — a deployment
+  property. Opt-in auto-no-cut-for-coding: `AIS_COT_NOCODE=1`. Lexgate stays opt-in (`AIS_OMNI_CODE=1`).
+
+> Found while benchmarking: SnapKV originally ran **only in the non-streaming path**, so streaming
+> clients (Cline) got no speedup. Fixed by routing the SnapKV setup into the streaming loop — the
+> numbers above are the streaming result. (Separately, `ais_prob`'s non-streaming response can
+> truncate very long generations; streaming is unaffected — benchmark with `stream:true`.)
+
+---
+
+## One path, every model (no per-model fork)
+
+Relevance is computed inside `build_attn_mha` (a gated hook, flash-attention on) for **every**
+architecture — Gemma included. The old Gemma-specific graph fork (`gemma4-iswa.cpp`) was dropped
+from routing after it measured **identical** to the FA hook (redundant 0.55 s / 123 tokens both):
+one code path, robust to llama.cpp updates, no porting per model.
+
+---
+
+## Repo layout
+
+| Path | What |
+|---|---|
+| `ais/ais_prob.cpp` | The AIS engine — entropic surprise + SnapKV router, OpenAI-compatible server (`AIS_OMNI`) |
+| `ais/start_omni.sh` | One-command launcher |
+| `ais/img/` | The figures shown in this README |
+| `src/`, `include/llama.h` | The flash-attention relevance hook (`build_attn_mha`) + KV-cache changes |
+
+> Minimal by design: just the engine, the launcher, and the core llama.cpp changes needed to run it.
+
+---
+
+*Built on top of [llama.cpp](https://github.com/ggerganov/llama.cpp) by Georgi Gerganov and
+contributors. AIS is a research/portfolio project — benchmarked on an Apple M4, 32 GB.*

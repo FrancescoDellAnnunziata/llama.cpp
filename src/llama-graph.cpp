@@ -805,6 +805,7 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_surprise    = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1949,6 +1950,46 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+    // ── AIS SnapKV — hook GENERICO di rilevanza (rotta C), gated da AIS_SNAPKV_FA ──────
+    // Rilevanza per posizione = attenzione delle ultime W query a TUTTE le chiavi in cache
+    // (k qui è la K piena: get_k dal caller), sommata sulle teste, per ogni layer ad
+    // attenzione PIENA. Calcolata QUI nella build_attn condivisa → vale per OGNI modello
+    // che passa di qui, SENZA forkare il grafo del singolo .cpp e con FLASH ON (lo slice
+    // [W×n_kv] è una mul_mat a parte, ~MB; l'attenzione principale resta intatta). Emessa
+    // per-layer come "ais_snap_rel" → l'host (ais_prob, AIS_SNAPKV_FA) accumula sui layer.
+    // Zero costo quando spento (un solo getenv cached). Salta: generazione (n_tok==1),
+    // multi-stream, e i layer SWA (n_kv ridotto → la maschera della finestra falserebbe).
+    {
+        // Gate anche su cb_eval != nullptr: l'host AZZERA il callback nei chunk NON-finali del
+        // prefill → la rilevanza (mul_mat [W×n_kv] + softmax + sum, per layer) NON viene
+        // costruita lì. Serve solo l'ULTIMO chunk (finestra-query finale + KV piena); gli altri
+        // erano calcolati e SCARTATI. = meno compute/sync sul prefill, più vicino a vanilla.
+        static const bool ais_snap_fa = getenv("AIS_SNAPKV_FA") != nullptr;
+        // AIS_SNAPKV_RELSTRIDE=S: calcola la rilevanza solo 1 layer ogni S (la rilevanza è
+        // ridondante tra layer) → meno compute/readback, segnale ~uguale. Default 1 (tutti).
+        static const int rel_stride = [](){ const char* v = getenv("AIS_SNAPKV_RELSTRIDE"); return v ? std::max(1, atoi(v)) : 1; }();
+        if (ais_snap_fa && cparams.cb_eval != nullptr && n_stream == 1 && q->ne[1] > 1 && !hparams.is_swa(il) && (il % rel_stride == 0)) {
+            static const int Wenv = getenv("AIS_SNAPKV_W") ? atoi(getenv("AIS_SNAPKV_W")) : 32;
+            const int64_t n_tok = q->ne[1];
+            const int     W     = Wenv < (int) n_tok ? Wenv : (int) n_tok;
+            ggml_tensor * kf = k;
+            if (kf->type != GGML_TYPE_F16 && kf->type != GGML_TYPE_F32) {
+                kf = ggml_cast(ctx0, kf, GGML_TYPE_F16);   // dequant K cache (es. q8_0→f16) per il mul_mat
+            }
+            ggml_tensor * qW = ggml_cont(ctx0, ggml_view_4d(ctx0, q, q->ne[0], W, q->ne[2], q->ne[3],
+                                            q->nb[1], q->nb[2], q->nb[3], (n_tok - W) * q->nb[1]));
+            ggml_tensor * kq_r = ggml_mul_mat(ctx0, kf, qW);          // [n_kv, W, n_head] (GQA broadcast)
+            ggml_mul_mat_set_prec(kq_r, GGML_PREC_F32);
+            ggml_tensor * sm = ggml_soft_max_ext(ctx0, kq_r, nullptr, kq_scale, 0.0f);
+            const int64_t nkv = sm->ne[0];
+            ggml_tensor * fl = ggml_reshape_2d(ctx0, ggml_cont(ctx0, sm), nkv, sm->ne[1] * sm->ne[2]);
+            ggml_tensor * sv = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, fl))); // [1, n_kv]
+            ggml_tensor * rl = ggml_reshape_1d(ctx0, sv, nkv);
+            cb(rl, "ais_snap_rel", il);
+            ggml_build_forward_expand(gf, rl);
+        }
+    }
 
     ggml_tensor * cur;
 

@@ -288,3 +288,10 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# ==========================================
+# AIS ENGINE
+# ==========================================
+add_executable(ais_prob ais/ais_prob.cpp)
+target_include_directories(ais_prob PRIVATE common src vendor vendor/cpp-httplib)
+target_link_libraries(ais_prob PRIVATE llama llama-common cpp-httplib)

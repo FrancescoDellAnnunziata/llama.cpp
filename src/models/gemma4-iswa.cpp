@@ -1,4 +1,6 @@
 #include "models.h"
+#include "llama-kv-cache.h"       // SnapKV cached-K: get_k(ctx, il) sul contesto base
+#include "llama-kv-cache-iswa.h"  // SnapKV cached-K: mctx->get_base() (attenzione piena)
 
 // get 2D slice view from a 3D tensor, the idx corresponds to the 3rd dim
 static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, int idx) {
@@ -36,6 +38,16 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
         // inp_per_layer shape: [n_embd_per_layer, n_tokens, n_layer]
         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
     }
+
+    // ── AIS SnapKV (Milestone C): rilevanza = attenzione delle ultime W query a
+    // tutte le chiavi, sommata su teste e layer pieni. Richiede ubatch SINGOLO
+    // (Kcur = tutte le N chiavi) + flash ON (l'attenzione principale resta economica;
+    // qui calcoliamo solo lo slice [W×N], ~MB). Output via t_embd (come il gather-dot).
+    // cb_eval != nullptr: l'host azzera il callback nei chunk non-finali del prefill → la
+    // rilevanza si calcola solo sull'ULTIMO chunk (KV piena); gli altri erano scartati.
+    const bool do_snap = getenv("AIS_SNAPKV") != nullptr && n_tokens > 1 && cparams.cb_eval != nullptr;
+    const int  snap_W  = getenv("AIS_SNAPKV_W") ? atoi(getenv("AIS_SNAPKV_W")) : 32;
+    ggml_tensor * snap_rel = nullptr;  // [n_kv] accumulato sui layer pieni
 
     for (int il = 0; il < n_layer; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
@@ -102,6 +114,28 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
             cur = build_attn(inp_attn, model.layers[il].wo,
                     nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     hparams.f_attention_scale, il);
+
+            // SnapKV cached-K (Milestone C-2): DOPO build_attn (cpy_k ha scritto il chunk in
+            // cache) → prendi la K in CACHE (TUTTE le N posizioni) e calcola l'attenzione
+            // delle ultime W query a tutte le chiavi. Funziona con prefill CHUNKED (niente
+            // ubatch singolo, niente OOM). Solo layer pieni (!is_swa) → get_base().
+            if (do_snap && !hparams.is_swa(il)) {
+                const int W = snap_W < (int) n_tokens ? snap_W : (int) n_tokens;
+                ggml_tensor * kc = inp_attn->mctx->get_base()->get_k(ctx0, il);   // [n_eh, n_head_kv, n_kv, ns]
+                if (kc->type != GGML_TYPE_F16 && kc->type != GGML_TYPE_F32)
+                    kc = ggml_cast(ctx0, kc, GGML_TYPE_F16);   // dequant K cache (es. q8_0→f16) per il mul_mat
+                ggml_tensor * kp = ggml_cont(ctx0, ggml_permute(ctx0, kc, 0, 2, 1, 3)); // [n_eh, n_kv, n_head_kv, ns]
+                ggml_tensor * qp = ggml_cont(ctx0, ggml_permute(ctx0, Qcur, 0, 2, 1, 3));// [n_eh, n_tokens, n_head]
+                ggml_tensor * qW = ggml_cont(ctx0, ggml_view_3d(ctx0, qp, qp->ne[0], W, qp->ne[2],
+                                                qp->nb[1], qp->nb[2], (n_tokens - W) * qp->nb[1]));
+                ggml_tensor * kq = ggml_mul_mat(ctx0, kp, qW);           // [n_kv, W, n_head] (GQA broadcast)
+                ggml_tensor * sm = ggml_soft_max_ext(ctx0, kq, nullptr, hparams.f_attention_scale, 0.0f);
+                const int64_t nkv = sm->ne[0];
+                ggml_tensor * fl = ggml_reshape_2d(ctx0, ggml_cont(ctx0, sm), nkv, sm->ne[1] * sm->ne[2]);
+                ggml_tensor * sv = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, fl))); // [1, n_kv]
+                ggml_tensor * rl = ggml_reshape_1d(ctx0, sv, nkv);
+                snap_rel = snap_rel ? ggml_add(ctx0, snap_rel, rl) : rl;
+            }
         } else {
             // reuse KV cache of earlier layers
             cur = build_attn(inp_attn,
@@ -242,21 +276,88 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
             LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
+    ggml_tensor * hidden = cur;   // [n_embd, n_outputs] post-final-norm, PRE-lm_head
     res->t_embd = cur;
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur);
+    // AIS scoring mode = embeddings on (pooling NONE) + multi-token batch. In that
+    // mode we emit per-token TARGET logits via the gather-dot below and SKIP the
+    // full 256k lm_head (the speedup). Generation (single token) and validation
+    // keep the full lm_head. AIS_VALIDATE_GATHER forces both (to compare).
+    static const bool ais_keep_full   = getenv("AIS_VALIDATE_GATHER") != nullptr;
+    // TODO#2: AIS_SURPRISE_OUT drives the gather-dot via a DEDICATED [1×N] tensor, so it does
+    // not need embeddings(pooling) on — letting the host skip the [n_embd_out×N] readback AND
+    // its buffer entirely. Otherwise the trigger stays the embeddings flag (validate / B2 path).
+    static const bool ais_surprise_out = getenv("AIS_SURPRISE_OUT") != nullptr;
+    const bool ais_scoring = (cparams.embeddings || ais_surprise_out) && res->t_inp_tokens && hidden->ne[1] > 1;
 
-    if (hparams.f_final_logit_softcapping) {
-        cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
-        cur = ggml_tanh(ctx0, cur);
-        cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+    // lm_head (full 256k projection) — conditional
+    if (!ais_scoring || ais_keep_full) {
+        ggml_tensor * logits = build_lora_mm(model.output, hidden);
+        if (hparams.f_final_logit_softcapping) {
+            logits = ggml_scale(ctx0, logits, 1.0f / hparams.f_final_logit_softcapping);
+            logits = ggml_tanh(ctx0, logits);
+            logits = ggml_scale(ctx0, logits, hparams.f_final_logit_softcapping);
+        }
+        cb(logits, "result_output", -1);
+        res->t_logits = logits;
+        ggml_build_forward_expand(gf, logits);
     }
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+    // ── AIS custom: "target-logit" gather-dot (Milestone B) ─────────────────
+    // When embeddings mode is on (cparams.embeddings, pooling NONE) and this is a
+    // multi-token batch, REPURPOSE the embeddings output to carry, per output
+    // position p, the logit of the NEXT input token:
+    //     target[p] = hidden[:,p] · W_out[:, token_{p+1}]   (then final softcap)
+    // That is exactly what AIS needs for per-token surprise, and it avoids
+    // materializing the full 256k-wide logits row (the lm_head readback tax).
+    // B1: we KEEP the full lm_head above so ais_prob can validate target==full
+    //     logits[tok]. B2 will SKIP the full lm_head when this path is active.
+    // ASSUMPTION: full-output scoring batch (n_outputs == n_tokens, contiguous),
+    //   so output p ↔ input token p and target = t_inp_tokens[p+1]; the last
+    //   position has no in-batch next token → target left 0 (caller ignores it).
+    // PORTING to another model: replicate this block right after that model's
+    //   lm_head, reusing its post-final-norm `hidden`, its `model.output`, and
+    //   its own final-logit transform (softcap/none). Everything else is generic.
+    // SnapKV cached-K: la rilevanza [n_kv] è un tensore a parte, nominato + espanso, letto
+    // via cb_eval (NON via t_embd: con prefill chunked n_outputs≠n_kv). embeddings resta on
+    // solo per saltare l'lm_head (t_embd = hidden, ignorato). Per chunk con n_kv massimo
+    // (ultimo chunk) ais_prob tiene quella rilevanza (= query globale → tutte le N chiavi).
+    if (do_snap && snap_rel) {
+        cb(snap_rel, "ais_snap_rel", -1);
+        ggml_build_forward_expand(gf, snap_rel);
+    }
 
-    ggml_build_forward_expand(gf, cur);
+    if (ais_scoring && !do_snap) {
+        const int64_t n_out = hidden->ne[1];
+        const int64_t n_eo  = hparams.n_embd_out();
+        ggml_tensor * nxt = ggml_view_1d(ctx0, res->t_inp_tokens, n_out - 1,
+                                         ggml_element_size(res->t_inp_tokens));      // token_{p+1}
+        ggml_tensor * Wr  = ggml_get_rows(ctx0, model.output, nxt);                  // [n_embd, n_out-1] (dequant)
+        ggml_tensor * h0  = ggml_view_2d(ctx0, hidden, hidden->ne[0], n_out - 1,
+                                         hidden->nb[1], 0);                           // [n_embd, n_out-1]
+        ggml_tensor * tl  = ggml_sum_rows(ctx0, ggml_mul(ctx0, h0, Wr));             // [1, n_out-1]
+        if (hparams.f_final_logit_softcapping) {
+            tl = ggml_scale(ctx0, tl, 1.0f / hparams.f_final_logit_softcapping);
+            tl = ggml_tanh(ctx0, tl);
+            tl = ggml_scale(ctx0, tl, hparams.f_final_logit_softcapping);
+        }
+        tl = ggml_pad(ctx0, tl, 0, 1, 0, 0);          // [1, n_out]    (last col = 0)
+        // TODO#2 (PROJECT_GUIDE): a DEDICATED [1, n_out] output instead of padding to the full
+        // [n_eo, n_out] embeddings width. The host then reads back only N floats (one target
+        // logit per position) instead of the [n_embd_out × N] embd buffer (~138MB @ 13.5k tok),
+        // sending the gather-dot "surprise region" to ~0. Gated by AIS_SURPRISE_OUT (A/B).
+        if (ais_surprise_out) {
+            cb(tl, "ais_surprise", -1);               // [1, n_out] — row p = target logit of token_{p+1}
+            res->t_surprise = tl;                     // dedicated narrow readback (see llama-context)
+            res->t_embd     = nullptr;                // disable the wide embeddings readback entirely
+            ggml_build_forward_expand(gf, tl);
+        } else {
+            tl = ggml_pad(ctx0, tl, n_eo - 1, 0, 0, 0);   // [n_eo, n_out] row0 = target logit
+            cb(tl, "ais_target_logits", -1);
+            res->t_embd = tl;
+            ggml_build_forward_expand(gf, tl);
+        }
+    }
 }
 
 // equivalent to get_per_layer_inputs() in python code

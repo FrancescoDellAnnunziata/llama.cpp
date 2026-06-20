@@ -86,6 +86,15 @@ bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return res;
 }
 
+bool llama_kv_cache_iswa::seq_rm_mask(llama_seq_id seq_id, llama_pos p0, const int8_t * keep, uint32_t n) {
+    bool res = true;
+
+    res = res & kv_base->seq_rm_mask(seq_id, p0, keep, n);
+    res = res & kv_swa ->seq_rm_mask(seq_id, p0, keep, n);
+
+    return res;
+}
+
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     kv_base->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);

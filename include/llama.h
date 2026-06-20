@@ -707,6 +707,17 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // AIS SnapKV: remove, in a SINGLE cell scan, every position p in [p0, p0+n) for which
+    // keep[p-p0] == 0 (1 byte per position). For scattered relevance-eviction this replaces
+    // R run-wise llama_memory_seq_rm calls (each O(n_cells) → O(R·n_cells)) with one O(n_cells)
+    // pass. seq_id < 0 matches any sequence. Returns false if a partial removal failed.
+    LLAMA_API bool llama_memory_seq_rm_mask(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+            const int8_t * keep,
+                  uint32_t n);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
@@ -959,6 +970,12 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Set (or clear, with NULL) the scheduler eval callback at runtime.
+    // A callback set makes the scheduler compute node-by-node with a per-split sync,
+    // which is needed to capture intermediate tensors but adds a per-decode cost.
+    // Clear it for the generation loop and restore it for prefill to avoid that cost.
+    LLAMA_API void llama_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_eval_callback cb, void * user_data);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
@@ -1006,6 +1023,13 @@ extern "C" {
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    // AIS gather-dot: dedicated per-token "surprise" output (the target logit of the next
+    // input token, computed via a [n_embd→1] gather-dot instead of the full lm_head). Only
+    // populated when the model build emits it (AIS scoring mode, AIS_SURPRISE_OUT). The host
+    // reads back 1 float per output row, avoiding the [n_embd_out × N] embeddings readback.
+    // Returns 0.0 for invalid ids / when not populated.
+    LLAMA_API float llama_get_ais_surprise_ith(struct llama_context * ctx, int32_t i);
 
     //
     // backend sampling API [EXPERIMENTAL]

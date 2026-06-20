@@ -147,3 +147,28 @@ poetry.toml
 a.out.*
 
 AGENTS.local.md
+
+# AIS harness — secrets (never commit)
+ais/harness/hf_tkn
+*.token
+hf_tkn
+
+# AIS bench — Python venv / caches (never commit; recreated locally)
+ais/bench/venv/
+ais/**/__pycache__/
+ais/**/*.pyc
+
+# AIS — private notes / publish drafts / harness (keep local, not in repo)
+ais/publish/
+ais/harness/
+ais/COMANDI.md
+ais/PROJECT_GUIDE.txt
+ais/SNAPKV_NOTES.md
+
+# AIS — repo kept minimal: only ais_prob.cpp + start_omni.sh + img/ are tracked.
+# Everything below stays on disk locally but out of the repo.
+ais/bench/
+ais/ais.cpp
+ais/ais_sc.cpp
+ais/surprise_cache.hpp
+ais/README.md

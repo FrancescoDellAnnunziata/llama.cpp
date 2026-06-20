@@ -101,6 +101,27 @@ struct llama_memory_i {
     virtual void clear(bool data) = 0;
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+
+    // AIS SnapKV: remove, in a SINGLE cell scan, every position p in [p0, p0+n) whose
+    // keep[p-p0] == 0. Scattered relevance-eviction otherwise needs R contiguous-run
+    // seq_rm calls, each a full cell scan → O(R·n_cells). This collapses it to one pass.
+    // Default: coalesce removed runs and call seq_rm (== the old behavior, any backend).
+    // KV caches override it with a single O(n_cells) scan. Returns false on failure.
+    virtual bool seq_rm_mask(llama_seq_id seq_id, llama_pos p0, const int8_t * keep, uint32_t n) {
+        bool ok = true;
+        uint32_t run = n;   // start of the current removed run; n = no run open
+        for (uint32_t i = 0; i <= n; ++i) {
+            const bool rm = (i < n) && (keep[i] == 0);
+            if (rm && run == n) {
+                run = i;
+            } else if (!rm && run != n) {
+                ok = ok && seq_rm(seq_id, p0 + (llama_pos) run, p0 + (llama_pos) i);
+                run = n;
+            }
+        }
+        return ok;
+    }
+
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
