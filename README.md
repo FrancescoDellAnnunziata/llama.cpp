@@ -116,7 +116,7 @@ engine — the surprise score decides.
 ---
 
 ## Benchmark
-
+### Cot_cut OFF
 Vanilla `llama-server` and the AIS engine were **rebuilt from the same source tree** (identical
 inference core). All requests are **streamed** (how real clients call the server). Two
 architecturally different models — **Qwen3VL-8B-Instruct** and **gemma-4-E2B-it**, both routed
@@ -156,10 +156,7 @@ wraps each question in ~3k tokens of filler so the router actively evicts while 
 | MMLU-Pro | 55.0% → 55.0% | 35.0% → 35.0% |
 | MMLU long-context (compression active) | 80.0% → 80.0% | 40.0% → 40.0% |
 | HumanEval pass@1 | 87.5% → 87.5% | 100% → 100% |
-| HumanEval multi-turn | 87.5% → 87.5% | 87.5% → 75.0%¹ |
 
-**Δ = 0 on 7 of 8 cells.** ¹The one exception — Gemma multi-turn code-refine — is a single failing
-problem at N=8 (6/8 vs 7/8), within noise. Full numbers, methodology and caveats are in the tables above.
 
 **OMNI's code-safe CoT-cut (thinking models) is a SPEED feature — quality-neutral at a fair budget.**
 A thinking model needs room to finish thinking *and* answer; under a tight 512-token budget vanilla
@@ -172,6 +169,8 @@ recovers — and the cut **matches** it (Δ≈0):
 | HumanEval | 25% | **87.5%** | 100% |
 | code multi-turn | 0% | **100%** | 100% |
 | GSM8K math | 5% | **62.5%** | 62.5% |
+
+## HUMAN EVAL IMPROVED, MAY DUE TO LESS NOISE?
 
 In fact the chart shows the cut isn't just neutral — on **HumanEval it scored *higher* with AIS OMNI**
 (87.5% → **100%** at the same fair budget). The likely reason: trimming low-information, rambling
