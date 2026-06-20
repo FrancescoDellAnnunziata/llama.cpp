@@ -124,8 +124,8 @@ through the FA hook. Apple M4, 32 GB · ctx 16384 · flash-attn on · KV f16 · 
 
 | Scenario | Qwen3VL-8B | gemma-4-E2B | What it proves |
 |---|---|---|---|
-| Single-turn, **dense unique** | 0.98× · ✅ | 0.97× · ✅ | **Equality** — within ~3% of vanilla, correct |
-| Single-turn, **redundant**    | **14.3×** · ✅ | **12.1×** · ✅ | **Speed** — dedup skips repeats before the forward pass |
+| Single-turn, **dense unique** | 0.98× | 0.97× | **Equality** — within ~3% of vanilla, correct |
+| Single-turn, **redundant**    | **14.3×** | **12.1×** | **Speed** — dedup skips repeats before the forward pass |
 | **Multi-turn** (5 follow-ups) | **1.42×** | **1.38×** | **Efficiency** — compressed prefix reused across turns |
 | **Peak RSS** (van/AIS/AIS-q8) | 12.4 / 10.5 / 9.5 GB | 5.7 / 5.3 / 5.1 GB | **Memory** — −15% / −23% (Qwen) |
 
@@ -381,6 +381,8 @@ one code path, robust to llama.cpp updates, no porting per model.
 | `src/`, `include/llama.h` | The flash-attention relevance hook (`build_attn_mha`) + KV-cache changes |
 
 > Minimal by design: just the engine, the launcher, and the core llama.cpp changes needed to run it.
+
+## readme writte by Claude
 
 ---
 
