@@ -1,9 +1,8 @@
 # AIS OMNI — Adaptive Ingestion System for llama.cpp
 
 **A model-agnostic KV-cache compression layer for [llama.cpp](https://github.com/ggerganov/llama.cpp).
-One flag. It filters low-information / redundant context before and inside the forward pass —
-equal to vanilla when there's nothing to gain, much faster on the redundant context real coding
-agents produce, lighter on RAM, and at zero quality cost.**
+It filters low-information / redundant context before and inside the forward pass —
+much faster lighter on RAM, and at zero quality cost.**
 
 **Works on every standard-attention model** (Gemma, Qwen, Llama, Mistral, …) through a single
 flash-attention hook — no per-model porting. And if you already run llama.cpp it's **dead simple**:
@@ -16,10 +15,8 @@ AIS_OMNI=1 build/bin/ais_prob "$MODEL" 0.7 sigma-mk --server 8080 --host 0.0.0.0
 # or simply:  bash ais/start_omni.sh /path/to/model.gguf
 ```
 
-`AIS_OMNI` is **streaming-native** (the path Cline and OpenAI clients actually use) and works on
-**every standard-attention model via one FA hook** — Gemma-4, Qwen3, Llama, Mistral, … (no per-model
-graph fork). It bundles SnapKV eviction + dedup pre-gate + multi-turn delta reuse + auto-MASS + a
-KV-bound gate (no tax on short prompts). Chat-safe by default; `AIS_OMNI_CODE` adds a syntax-aware
+`AIS_OMNI` bundles SnapKV eviction + dedup pre-gate + multi-turn delta reuse + auto-MASS + a
+KV-bound gate (no tax on short prompts) + CoT-cut. Chat-safe by default; `AIS_OMNI_CODE` adds a syntax-aware
 lexgate for pure coding, `AIS_SNAPKV_KVQ8=1` halves KV memory.
 
 What each piece means:
@@ -97,14 +94,14 @@ What each piece means:
 
 ### How it works, in two animations
 
-**1. The concept — a redundant prompt.** Same prompt, side by side: **vanilla keeps every token in the
+**1. The concept — a redundant prompt.** Same prompt: **vanilla keeps every token in the
 KV cache** and attends to all of them; **AIS OMNI evicts the redundant/low-relevance tokens**
 (orange → grey), attends to far fewer, and decodes faster — same answer, fewer tokens. (Hand-drawn to
 make the idea legible.)
 
 ![KV cache: vanilla full vs AIS OMNI evicted](ais/img/kv_compare.gif)
 
-**2. The same idea on a real, *dense* prompt — the "do no harm" case.** This is the actual per-token
+**2. The same idea on a real, *dense* prompt .** This is the actual per-token
 keep/evict decision OMNI made on **~9.2k tokens of real documentation**, captured live from the running
 server. Because the content is mostly dense and unique, it **keeps the vast majority** — `6,719 / 9,258`
 tokens (green), evicting only the redundant build-log noise (grey): just **−27%** of the cache, answer
@@ -115,11 +112,9 @@ engine — the surprise score decides.
 
 ---
 
-## Benchmark (the only one I tested)
+## Benchmark (that I tested)
 ### Cot_cut OFF
-Vanilla `llama-server` and the AIS engine were **rebuilt from the same source tree** (identical
-inference core). All requests are **streamed** (how real clients call the server). Two
-architecturally different models — **Qwen3VL-8B-Instruct** and **gemma-4-E2B-it**, both routed
+Two architecturally different models — **Qwen3VL-8B-Instruct** and **gemma-4-E2B-it**, both routed
 through the FA hook. Apple M4, 32 GB · ctx 16384 · flash-attn on · KV f16 · temperature 0.
 
 | Scenario | Qwen3VL-8B | gemma-4-E2B | What it proves |
@@ -179,13 +174,6 @@ Small N (8 problems), so read it as suggestive, not proof — but it's a real "c
 
 ![CoT-cut: a real speed win (left); quality-neutral at a fair budget (right)](ais/img/cotcut.png)
 
-The cut's real value is **speed**: an `AIS_COT_OFF=1` ablation shows single-turn dense is 0.97× (parity)
-with the cut off and **1.09×** with it on — it reaches the same answer in ~50 fewer thinking tokens.
-(The "rescue" numbers some earlier drafts showed were a 512-token budget artifact, not a quality lift.
-The 26B does ramble past even 4096 tokens, so there the cut is what lets it answer within a practical
-budget — but the small-model test above is the clean apples-to-apples one.)
-
----
 
 ## Get started (from zero, ~5 commands)
 
@@ -382,7 +370,7 @@ one code path, robust to llama.cpp updates, no porting per model.
 
 > Minimal by design: just the engine, the launcher, and the core llama.cpp changes needed to run it.
 
-## readme writte by Claude
+## readme written by Claude 
 
 ---
 
