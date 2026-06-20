@@ -2,7 +2,7 @@
 
 **A model-agnostic KV-cache compression layer for [llama.cpp](https://github.com/ggerganov/llama.cpp).
 It filters low-information / redundant context before and inside the forward pass —
-much faster lighter on RAM, and at zero quality cost.**
+much faster lighter on RAM, at zero quality cost and INCREASE CONTEXT WINDOWS!**
 
 **Works on every standard-attention model** (Gemma, Qwen, Llama, Mistral, …) through a single
 flash-attention hook — no per-model porting. And if you already run llama.cpp it's **dead simple**:
