@@ -115,7 +115,7 @@ engine — the surprise score decides.
 
 ---
 
-## Benchmark
+## Benchmark (the only one I tested)
 ### Cot_cut OFF
 Vanilla `llama-server` and the AIS engine were **rebuilt from the same source tree** (identical
 inference core). All requests are **streamed** (how real clients call the server). Two
