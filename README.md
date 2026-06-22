@@ -1,3 +1,4 @@
+# THE ENTROPY ENGINE
 # AIS OMNI — Adaptive Ingestion System for llama.cpp
 
 **A model-agnostic KV-cache compression layer for [llama.cpp](https://github.com/ggerganov/llama.cpp).
