@@ -1,12 +1,13 @@
-# THE ENTROPY ENGINE
 # AIS OMNI — Adaptive Ingestion System for llama.cpp
+![AIS LOGO](ais/img/logood.jpg)
 
+---
 **A model-agnostic KV-cache compression layer for [llama.cpp](https://github.com/ggerganov/llama.cpp).
 It filters low-information / redundant context before and inside the forward pass —
 much faster lighter on RAM, at zero quality cost and INCREASE CONTEXT WINDOWS!**
 
 **Works on every standard-attention model** (Gemma, Qwen, Llama, Mistral, …) through a single
-flash-attention hook — no per-model porting. And if you already run llama.cpp it's **dead simple**:
+flash-attention hook —. no per-model porting. And if you already run llama.cpp it's **dead simple**:
 build one target, set one env var, point your client at `:8080/v1`. That's the whole setup.
 
 Point any OpenAI-compatible client (Cline, Continue, your own app) at `http://localhost:8080/v1`.
@@ -41,20 +42,17 @@ What each piece means:
   or a fixed ratio via `AIS_SNAPKV_KEEP`.
 - **KV-bound gate** — compression only engages when decoding is actually *KV-bound*, i.e. the context
   is long enough that attention over the cache dominates cost. Below the threshold
-  (`AIS_SNAPKV_KVBOUND`, default ~2500 tokens) the router stays out of the way and runs identical to
+  (`AIS_SNAPKV_KVBOUND`) the router stays out of the way and runs identical to
   vanilla — that's the "no tax on short prompts": small chats and one-liners aren't slowed down by
   machinery that can't pay off.
 - **CoT-cut** — (thinking models only; on by default in OMNI, scoped strictly to the *thinking* phase).
   While the model reasons, each generated token's surprise (−log₂ p) is measured; when the thought goes
   low-information — a run of 24 consecutive tokens each below 0.05 bit, i.e. the model is just confidently
   restating itself — the thinking phase is closed early and the model is made to answer. The first 48
-  thinking tokens are always protected and the cut **can never touch the answer or code**. Net: the same
-  answer in ~50 fewer thinking tokens (single-turn dense 0.97×→1.09×); it's a *speed* feature,
-  quality-neutral at a fair budget. Disable with `AIS_COT_OFF=1`. (Full math + where it's active in each
-  plot: ["Under the hood"](#under-the-hood-the-surprise-score-sigma-mk-and-cot-cut) below.)
+  thinking tokens are always protected and the cut **can never touch the answer or code**. 
 
 <details>
-<summary><b>New to the jargon? Every background term, plainly (click to expand)</b></summary>
+<summary><b>Every background term, plainly (click to expand)</b></summary>
 
 - **Token** — the unit a model reads and writes, ~¾ of a word. Models process one token at a time.
 - **Context / ctx window** — how many tokens the model can hold at once (e.g. `--ctx 16384`). Bigger = more memory.
