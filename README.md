@@ -121,7 +121,7 @@ KV f16 · temperature 0. Measured June 2026. `vanilla → ais_omni`:
 
 | Metric | Qwen3VL-8B | gemma-4-E2B | What it proves |
 |---|---|---|---|
-| Single-turn, **dense unique** (latency) | 82.7→66.9s · 1.24× | 15.9→16.4s · ~parity | Equality — nothing to compress, no tax |
+| Single-turn, **dense unique** (latency) | 82.7→66.9s · 1.24× | 15.9→16.4s · ~parity | It depends on how dense it is, if nothing to compress, no tax |
 | Single-turn, **redundant** (total latency) | 34.2→1.45s · **23.6×** | 5.9→0.50s · **11.9×** | Speed — compression skips the redundant prefill |
 | Single-turn, **redundant** (prefill / TTFT) | 33.2→0.67s · **50×** | 5.6→0.20s · **28×** | The pure compression effect |
 | **Multi-turn** (5 turns, cumulative) | 61.6→34.5s · **1.78×** | 14.5→10.4s · **1.40×** | Efficiency — compressed prefix reused |
