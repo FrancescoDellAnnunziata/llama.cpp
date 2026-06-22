@@ -290,6 +290,8 @@ Lower **k** → more aggressive. That single rule is the content-adaptivity: the
 repetitive log far more than a dense source file, because their surprise distributions differ.
 **auto-MASS** sits on top, picking k / coverage automatically from measured n-gram redundancy.
 
+---
+
 ### CoT-cut — chain-of-thought cut
 
 A **speed** feature for *thinking* models, scoped strictly to the thinking phase. While the model
@@ -300,28 +302,11 @@ first **`MINT=48`** thinking tokens are always protected, and the cut **can neve
 code** — only the reasoning. Optional caps (`AIS_COT_MAXTHINK` / `AIS_COT_MAXTHINK_FRAC`) guarantee
 budget is left for the answer; `AIS_COT_OFF=1` disables it entirely.
 
-Net effect: the same answer in ~50 fewer thinking tokens → single-turn dense **0.97× → 1.09×**. It is
-**quality-neutral at a fair token budget** — the apparent "rescue" in early drafts was a 512-token
-starvation artifact (see the thinking-model table near the top).
-
-#### Where CoT-cut is active in the benchmarks
-
-CoT-cut only does anything when the model is *in a thinking phase*, so it's a no-op on non-thinking runs
-even though it ships inside `AIS_OMNI`:
-
-| Plot / result | CoT-cut | Why |
-|---|---|---|
-| `cotcut.png` | **the subject** (on vs off, @512 vs @4096 budget) | This *is* the CoT-cut experiment |
-| `omni_26b.png` (gemma-4-26B, thinking on) | **active & contributing** | Real thinking phase to trim |
-| speed/memory charts (`multiturn_*`, `memory_*`) | bundled, **not the driver** | Speed here is dedup + eviction; the `AIS_COT_OFF` ablation (0.97×→1.09×) isolates CoT-cut's own single-turn share |
-| quality benchmarks (MMLU-Pro / HumanEval) | active, **scoped to thinking** | Confirms it changes speed, not the answer (Δ≈0) |
 
 ---
 
 ## Honest caveats
 
-- **Single-turn is parity, not a speedup.** On dense unique input AIS still prefills everything to
-  score relevance, then evicts — the single-turn *speed* win is the redundant case.
 - **`KVQ8` is a memory knob, not a speed knob** — trades ~7%+ prefill for the lowest RAM.
 - **Deep buried-token recall can soften under KEEP=0.4** — a unique value re-asked many turns into a
   conversation occasionally returns truncated. Measured: one multi-turn needle missed (ais **3/4** vs
@@ -329,26 +314,11 @@ even though it ships inside `AIS_OMNI`:
   visible at benchmark level (MMLU/HumanEval Δ≈0); tunable via `AIS_SNAPKV_KEEP`/`MINKEEP`.
 - **Small samples.** Accuracy is MMLU-Pro n=20 / HumanEval n=8 — read the Δ=0 as strong evidence, not
   a publication-grade proof (use n≥50 for that).
-- **CoT-cut is a speed feature, quality-neutral at a fair budget.** It compresses the *thinking* phase
-  of thinking models (only while in the thought phase — never truncates the answer/code), reaching the
-  same answer in fewer tokens (single-turn dense 0.97×→**1.09×**). At a fair 4096-token budget vanilla
-  and cut-ON are **Δ≈0** — the "rescue" numbers in earlier drafts were a 512-token starvation artifact.
-  Under a *tight* fixed budget the cut also protects quality (vanilla would run out) — a deployment
-  property. Opt-in auto-no-cut-for-coding: `AIS_COT_NOCODE=1`. Lexgate stays opt-in (`AIS_OMNI_CODE=1`).
 
 > Found while benchmarking: SnapKV originally ran **only in the non-streaming path**, so streaming
 > clients (Cline) got no speedup. Fixed by routing the SnapKV setup into the streaming loop — the
 > numbers above are the streaming result. (Separately, `ais_prob`'s non-streaming response can
 > truncate very long generations; streaming is unaffected — benchmark with `stream:true`.)
-
----
-
-## One path, every model (no per-model fork)
-
-Relevance is computed inside `build_attn_mha` (a gated hook, flash-attention on) for **every**
-architecture — Gemma included. The old Gemma-specific graph fork (`gemma4-iswa.cpp`) was dropped
-from routing after it measured **identical** to the FA hook (redundant 0.55 s / 123 tokens both):
-one code path, robust to llama.cpp updates, no porting per model.
 
 ---
 
