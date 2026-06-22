@@ -339,6 +339,12 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+// AIS_SNAPKV_RUNEVICT: pin the allocator append-only — don't lower `head` into freed holes and
+// don't reset it to 0 — so the physical slot index stays == token position across mid-prefill
+// evictions, which the slot-indexed SnapKV relevance hook relies on. Trade-off: evicted cells are
+// not reused until the cache is cleared. No-op (zero overhead, identical behavior) when unset.
+static const bool ais_kv_append_only = getenv("AIS_SNAPKV_RUNEVICT") != nullptr;
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -369,7 +375,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
 
         // If we freed up a slot, set head to it so searching can start there.
-        if (new_head != cells.size() && new_head < head) {
+        if (ais_kv_append_only) {
+            head = cells.used_max_p1();   // append-only: head at the true tail — no middle-hole reuse,
+                                          // but tail-truncation still moves head back → slot == position
+        } else if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
     } else {
@@ -440,7 +449,9 @@ bool llama_kv_cache::seq_rm_mask(llama_seq_id seq_id, llama_pos p0, const int8_t
             }
         }
 
-        if (new_head != cells.size() && new_head < head) {
+        if (ais_kv_append_only) {
+            head = cells.used_max_p1();   // append-only: head at the true tail (see seq_rm) → slot == position
+        } else if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
     };
@@ -975,7 +986,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
-        if (head_cur > cells.get_used() + 2*n_tokens) {
+        // AIS running-eviction: keep append-only (see ais_kv_append_only) so freed holes are not
+        // refilled and slot index stays == token position across mid-prefill evictions.
+        if (head_cur > cells.get_used() + 2*n_tokens && !ais_kv_append_only) {
             head_cur = 0;
         }
 

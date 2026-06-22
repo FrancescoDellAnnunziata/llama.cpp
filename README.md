@@ -113,33 +113,57 @@ engine — the surprise score decides.
 ---
 
 ## Benchmark (that I tested)
-### Cot_cut OFF
-Two architecturally different models — **Qwen3VL-8B-Instruct** and **gemma-4-E2B-it**, both routed
-through the FA hook. Apple M4, 32 GB · ctx 16384 · flash-attn on · KV f16 · temperature 0.
+Vanilla `llama-server` and the AIS engine — same Q8 GGUF both sides (identical quantization), all
+requests streamed (thinking off). Two architecturally different models — **Qwen3VL-8B-Instruct** and
+**gemma-4-E2B-it**, both routed through the FA hook. Apple M4, 32 GB · ctx 16384 · flash-attn on ·
+KV f16 · temperature 0. Measured June 2026. `vanilla → ais_omni`:
 
-| Scenario | Qwen3VL-8B | gemma-4-E2B | What it proves |
+| Metric | Qwen3VL-8B | gemma-4-E2B | What it proves |
 |---|---|---|---|
-| Single-turn, **dense unique** | 0.98× | 0.97× | **Equality** — within ~3% of vanilla, correct |
-| Single-turn, **redundant**    | **14.3×** | **12.1×** | **Speed** — dedup skips repeats before the forward pass |
-| **Multi-turn** (5 follow-ups) | **1.42×** | **1.38×** | **Efficiency** — compressed prefix reused across turns |
-| **Peak RSS** (van/AIS/AIS-q8) | 12.4 / 10.5 / 9.5 GB | 5.7 / 5.3 / 5.1 GB | **Memory** — −15% / −23% (Qwen) |
+| Single-turn, **dense unique** (latency) | 82.7→66.9s · 1.24× | 15.9→16.4s · ~parity | Equality — nothing to compress, no tax |
+| Single-turn, **redundant** (total latency) | 34.2→1.45s · **23.6×** | 5.9→0.50s · **11.9×** | Speed — compression skips the redundant prefill |
+| Single-turn, **redundant** (prefill / TTFT) | 33.2→0.67s · **50×** | 5.6→0.20s · **28×** | The pure compression effect |
+| **Multi-turn** (5 turns, cumulative) | 61.6→34.5s · **1.78×** | 14.5→10.4s · **1.40×** | Efficiency — compressed prefix reused |
+| **Peak RSS** (KV f16) | 12.3→10.5 GB · **−15%** | 5.66→5.26 GB · **−7%** | Memory (`AIS_SNAPKV_KVQ8=1` halves KV for more) |
+| **Prompt tokens** (real workload) | 37.6k→15.0k · **−60%** | 36.4k→13.8k · **−62%** | Fewer tokens processed, same answers |
+| **Accuracy** (MMLU-Pro / HumanEval) | 55→55% / 88→88% | 35→35% / 100→100% | **Δ = 0** — compression does not change the answer |
 
-**Validated on the real 26B too** (gemma-4-26B-A4B, thinking-on, f16): redundant **7.4×**,
-multi-turn **1.31×**, single-turn parity, RAM −5%, needle **4/4** — the wins hold on the production
-model, not just the small ones.
+All scenarios recall the needle, except one multi-turn case (ais 3/4 vs vanilla 4/4) — see Honest caveats.
 
-![26B](ais/img/omni_26b.png)
+![prefill qwen](ais/img/bench_prefill_qwen.png)
+
+*Prefill on the 8B: redundant context 33.2s → 0.67s (50×); dense ~parity. This is where compression pays.*
 
 <table>
 <tr>
-<td><img src="ais/img/multiturn_qwen.png" width="430"/></td>
-<td><img src="ais/img/memory_qwen.png" width="430"/></td>
+<td><img src="ais/img/bench_unified_qwen.png" width="430"/></td>
+<td><img src="ais/img/bench_unified_gemma.png" width="430"/></td>
 </tr>
 <tr>
-<td align="center"><sub>Multi-turn: cumulative latency separates from turn 1</sub></td>
-<td align="center"><sub>Peak RSS: −15% (f16) / −23% (KV-q8)</sub></td>
+<td align="center"><sub>Qwen-8B — speed / accuracy (Δ0) / RAM / tokens, one view</sub></td>
+<td align="center"><sub>gemma-E2B — the same four metrics</sub></td>
 </tr>
 </table>
+
+**Adaptive — compresses with redundancy, keeps dense input.** Compression scales **43% → 92%** as
+prompt redundancy goes 0 → 97%, with the needle preserved at every level. The KV stays ~flat as
+context grows: at 10k input tokens vanilla processes 10,132 tokens, AIS **123 (−99%)**.
+
+<table>
+<tr>
+<td><img src="ais/img/bench_redundancy.png" width="430"/></td>
+<td><img src="ais/img/bench_scaling.png" width="430"/></td>
+</tr>
+<tr>
+<td align="center"><sub>Compression vs prompt redundancy (needle OK at every level)</sub></td>
+<td align="center"><sub>Tokens processed vs context length — AIS stays flat</sub></td>
+</tr>
+</table>
+
+**Also previously validated on the production 26B** (gemma-4-26B-A4B, thinking-on, f16): redundant
+**7.4×**, multi-turn **1.31×**, single-turn parity, RAM −5%, needle 4/4.
+
+![26B](ais/img/omni_26b.png)
 
 ### Quality — compression must not change the answer
 
@@ -165,7 +189,7 @@ recovers — and the cut **matches** it (Δ≈0):
 | code multi-turn | 0% | **100%** | 100% |
 | GSM8K math | 5% | **62.5%** | 62.5% |
 
-## HUMAN EVAL IMPROVED, MAY DUE TO LESS NOISE?
+### A note — HumanEval sometimes improved (less noise?)
 
 In fact the chart shows the cut isn't just neutral — on **HumanEval it scored *higher* with AIS OMNI**
 (87.5% → **100%** at the same fair budget). The likely reason: trimming low-information, rambling
@@ -334,8 +358,11 @@ even though it ships inside `AIS_OMNI`:
   score relevance, then evicts — the single-turn *speed* win is the redundant case.
 - **`KVQ8` is a memory knob, not a speed knob** — trades ~7%+ prefill for the lowest RAM.
 - **Deep buried-token recall can soften under KEEP=0.4** — a unique value re-asked many turns into a
-  conversation occasionally returns truncated. Not visible at benchmark level (MMLU/HumanEval Δ≈0);
-  tunable via `AIS_SNAPKV_KEEP`/`MINKEEP`.
+  conversation occasionally returns truncated. Measured: one multi-turn needle missed (ais **3/4** vs
+  vanilla 4/4); single-turn recall held at every redundancy level (needle OK up to 97% redundant). Not
+  visible at benchmark level (MMLU/HumanEval Δ≈0); tunable via `AIS_SNAPKV_KEEP`/`MINKEEP`.
+- **Small samples.** Accuracy is MMLU-Pro n=20 / HumanEval n=8 — read the Δ=0 as strong evidence, not
+  a publication-grade proof (use n≥50 for that).
 - **CoT-cut is a speed feature, quality-neutral at a fair budget.** It compresses the *thinking* phase
   of thinking models (only while in the thought phase — never truncates the answer/code), reaching the
   same answer in fewer tokens (single-turn dense 0.97×→**1.09×**). At a fair 4096-token budget vanilla
@@ -370,7 +397,61 @@ one code path, robust to llama.cpp updates, no porting per model.
 
 > Minimal by design: just the engine, the launcher, and the core llama.cpp changes needed to run it.
 
-## readme written by Claude 
+---
+
+## Changelog
+
+### 2026-06 — robustness fixes + benchmark refresh
+
+**Engine (`ais/ais_prob.cpp`)**
+- **Streaming deadlock fixed.** The SSE provider is now wrapped so the request mutex is always
+  released. `common_chat_parse()` runs per generated token and can throw; previously that stranded
+  the lock and deadlocked every subsequent request.
+- **`prompt_is_coding()` overflow fixed.** 64-bit arithmetic — no signed-int overflow on
+  multi-megabyte prompts.
+- **`AIS_EVICT_DUMP` file handle leak fixed.** Managed via RAII (`unique_ptr`), closed even if the
+  JSON escaping throws.
+- **`random_id()` data race removed.** RNG is now `thread_local`.
+- **`AIS_SNAPKV_RUNEVICT` is value-based** (`=0` disables, `=1` enables) and stays opt-in: measured
+  fragile on sliding-window models, where a mid-prefill bail forces a full re-prefill (slower);
+  correctness is always preserved by the clean fallback.
+- **CoT-cut is default-on consistently.** The non-streaming batch path now honours
+  `AIS_COMPRESS_COT`, matching the streaming path.
+
+**Core (`src/llama-kv-cache.cpp`)**
+- Append-only KV allocator gated on `AIS_SNAPKV_RUNEVICT` (no-op when unset): keeps the physical slot
+  index equal to the token position across mid-prefill evictions, which the slot-indexed SnapKV
+  relevance hook relies on.
+
+**Benchmarks — re-measured on one consistent methodology** (June 2026, same Q8 GGUF both sides, KV f16,
+greedy, streamed, thinking off). `vanilla → ais_omni`:
+- **Qwen3VL-8B:** redundant **23.6×** (prefill **50×**), multi-turn **1.78×**, peak RSS **−15%**,
+  prompt tokens **−60%**, accuracy Δ=0 (MMLU-Pro 55%, HumanEval 88%).
+- **gemma-4-E2B:** redundant **11.9×** (prefill **28×**), multi-turn **1.40×**, peak RSS **−7%**,
+  prompt tokens **−62%**, accuracy Δ=0 (MMLU-Pro 35%, HumanEval 100%).
+- **Adaptivity:** compression scales **43% → 92%** with prompt redundancy; needle preserved at every level.
+- **Scaling:** at 10k input tokens AIS processes **123 (−99%)** while vanilla processes all 10,132.
+- Earlier figures measured with thinking ON diluted the redundant case with generation time
+  (e.g. gemma 2.7× instead of 11.9×); the table above is the consistent thinking-off run.
+
+**Research notes — measured, intentionally NOT shipped as defaults**
+- **Lowering the KV-bound gate** compresses earlier (more tokens saved at equal correctness) but is
+  *not* a wall-time speedup at small scale — flat to slightly slower; kept at 2500.
+- **Compressing noise does not improve accuracy.** Neutral on genuinely irrelevant filler, negative
+  when the "noise" carries usable signal. Compression is a speed/RAM optimization, not a denoiser.
+- **`AIS_GATHER_SCORE`** (skip the full lm_head during scoring) is ~19% faster but changes the kept
+  set and broke needle recall in an A/B — left off by default.
+
+---
+
+## Support
+
+AIS is an independent research / portfolio project. If it's useful to you — or it saved you
+tokens and time — you can buy me a coffee. Every contribution supports development and benchmarks.
+
+[![PayPal](https://img.shields.io/badge/PayPal-Buy%20me%20a%20coffee-00457C?logo=paypal&logoColor=white)](https://paypal.me/francidella)
+
+https://paypal.me/francidella
 
 ---
 

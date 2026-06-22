@@ -11,6 +11,7 @@
 #include <vector>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <numeric>
 #include <iostream>
@@ -22,8 +23,26 @@
 #include <arm_neon.h>
 #endif
 
-// chat.h already defines: using json = nlohmann::ordered_json
 using ordered_json = nlohmann::ordered_json;
+
+// ==========================================
+// RAII deleters for the llama C handles (free on scope exit / error return)
+// ==========================================
+struct LlamaModelDel   { void operator()(llama_model*   p) const { if (p) llama_model_free(p);   } };
+struct LlamaCtxDel     { void operator()(llama_context* p) const { if (p) llama_free(p);          } };
+struct LlamaSamplerDel { void operator()(llama_sampler* p) const { if (p) llama_sampler_free(p);  } };
+using ModelPtr   = std::unique_ptr<llama_model,   LlamaModelDel>;
+using CtxPtr     = std::unique_ptr<llama_context, LlamaCtxDel>;
+using SamplerPtr = std::unique_ptr<llama_sampler, LlamaSamplerDel>;
+
+// ==========================================
+// ENV helpers (DRY): one-shot getenv parsing with a default.
+// NB: most call sites intentionally cache via `static const ... = []{...}()` so
+// the env is read exactly once — keep those; these helpers replace the ad-hoc
+// `getenv(k) ? atox(getenv(k)) : d` idiom (which calls getenv twice).
+// ==========================================
+static int    env_int  (const char* k, int    d) { const char* v = getenv(k); return v ? atoi(v) : d; }
+static double env_float (const char* k, double d) { const char* v = getenv(k); return v ? atof(v) : d; }
 
 // ==========================================
 // CONFIG
@@ -35,7 +54,7 @@ struct AISProbConfig {
     int   ctx_limit          = 32768;
 };
 
-static const int   MIN_DOC_SIZE       = 2000;
+static const int   MIN_DOC_SIZE       = 1000;
 static const float NEIGHBOR_THRESHOLD = 8.0f;
 static const int   NEIGHBOR_WIN       = 4;  // wider window protects XML tag structure around high-surprise identifiers
 
@@ -143,8 +162,8 @@ static inline double cot_surprise(const float* lg, llama_token id, int n_vocab) 
 //   AIS_COT_MAXTHINK_FRAC=f   tetto = f·max_tokens (AUTO-SCALA per cap/bench: garantisce (1−f) alla risposta)
 // 0 = off. Se entrambi attivi → si usa il minore.
 static int cot_think_cap(int max_tokens) {
-    static const int    abs_t = getenv("AIS_COT_MAXTHINK")      ? atoi(getenv("AIS_COT_MAXTHINK"))      : 0;
-    static const double frac  = getenv("AIS_COT_MAXTHINK_FRAC") ? atof(getenv("AIS_COT_MAXTHINK_FRAC")) : 0.0;
+    static const int    abs_t = env_int  ("AIS_COT_MAXTHINK",      0);
+    static const double frac  = env_float("AIS_COT_MAXTHINK_FRAC", 0.0);
     int cap = (abs_t > 0) ? abs_t : 0;
     if (frac > 0.0) { int f = (int)(frac * max_tokens); cap = (cap > 0) ? std::min(cap, f) : f; }
     return cap;   // >0 = attivo (taglia a `cap` token di pensiero)
@@ -168,11 +187,30 @@ static void batch_add(llama_batch& b, llama_token id, llama_pos pos, bool logits
 }
 
 static std::string random_id() {
-    static std::mt19937 rng(std::random_device{}());
-    static const char hex[] = "0123456789abcdef";
+    // thread_local: the server only happens to serialize callers via `mtx` today;
+    // making the RNG per-thread removes the latent data race if that ever changes.
+    static thread_local std::mt19937 rng(std::random_device{}());
+    static constexpr char hex[] = "0123456789abcdef";
     std::string s(8, '0');
     for (auto& c : s) c = hex[rng() % 16];
     return s;
+}
+
+// Scan only the freshly appended tail of `s` for `needle`, with a back-overlap of
+// (needle_len-1) so a match straddling the previous append boundary isn't missed.
+// O(appended) per call instead of O(s.size()) — avoids O(n²) over a long stream.
+static bool tail_contains(const std::string& s, int appended, const char* needle, size_t needle_len) {
+    const size_t app  = appended > 0 ? (size_t)appended : 0;
+    const size_t back = needle_len > 1 ? needle_len - 1 : 0;
+    const size_t from = (s.size() > app + back) ? s.size() - app - back : 0;
+    return s.find(needle, from) != std::string::npos;
+}
+
+// AIS_IGNORE_EOS: benchmarking only — keep generating to max_tokens (ignore end-of-generation)
+// so throughput (tok/s) is measured over a fixed token count, comparable across backends.
+static bool ais_ignore_eos() { static const bool v = getenv("AIS_IGNORE_EOS") != nullptr; return v; }
+static bool ais_is_eog(const llama_vocab* vocab, llama_token id) {
+    return !ais_ignore_eos() && llama_vocab_is_eog(vocab, id);
 }
 
 // n_batch (logical batch). The per-token logits buffer llama reserves is
@@ -196,7 +234,7 @@ static ggml_type kv_type_from_str(const std::string& s) {
     if (s == "q5_0") return GGML_TYPE_Q5_0;
     if (s == "q4_1") return GGML_TYPE_Q4_1;
     if (s == "q4_0") return GGML_TYPE_Q4_0;
-    fprintf(stderr, "⚠️  Unsupported cache type '%s', falling back to f16\n", s.c_str());
+    fprintf(stderr, " Unsupported cache type '%s', falling back to f16\n", s.c_str());
     return GGML_TYPE_F16;
 }
 
@@ -220,7 +258,7 @@ static std::vector<llama_token> dedup_prefilter(const std::vector<llama_token>& 
                                                 int anchor, int recent, int ngram) {
     const int N = (int)raw.size();
     std::vector<llama_token> out; out.reserve(N);
-    std::set<uint64_t> seen;
+    std::unordered_set<uint64_t> seen;
     std::vector<llama_token> hist;
     for (int i = 0; i < N; i++) {
         if (i < anchor || i >= N - recent) { out.push_back(raw[i]); continue; }
@@ -323,6 +361,7 @@ static int ais_do_encode(
     bool                            surgery_mode = false)
 {
     const int n_batch = ais_n_batch();
+    if (slice_N <= 0) { batch.n_tokens = 0; return kv_start; }  // nothing to encode (guards all /slice_N below)
 
     // ── XML+FC PROTECTION ──
     std::vector<bool> xml_protected(slice_N, false);
@@ -389,7 +428,7 @@ static int ais_do_encode(
         }
     }
     int n_prot = (int)std::count(xml_protected.begin(), xml_protected.end(), true);
-    fprintf(stderr, "🔒 XML+FC-protected: %d (%.1f%%)\n", n_prot, 100.0f * n_prot / slice_N);
+    fprintf(stderr, "XML+FC-protected: %d (%.1f%%)\n", n_prot, 100.0f * n_prot / slice_N);
 
     // ── NEIGHBOR WINDOW: adattivo a densità XML e distribuzione sorprese ──
     // Con NEIGHBOR_WIN=4 fisso e avg=16+ bit, ogni token scatta la finestra
@@ -406,7 +445,7 @@ static int ais_do_encode(
     float s_loc_avg = s_loc_sum / std::max(1, slice_N);
     float s_loc_std = std::sqrt(std::max(0.0f, s_loc_sum2/slice_N - s_loc_avg*s_loc_avg));
     float eff_neigh_thr = std::max(NEIGHBOR_THRESHOLD, s_loc_avg + 0.5f * s_loc_std);
-    fprintf(stderr, "🪟 Neighbor: win=%d thr=%.1f bit (xml=%.1f%%)\n",
+    fprintf(stderr, "Neighbor: win=%d thr=%.1f bit (xml=%.1f%%)\n",
             eff_neighbor_win, eff_neigh_thr, 100.0f * xml_density);
 
     // ── KEEP SET ──
@@ -421,26 +460,31 @@ static int ais_do_encode(
     // soglia di sorpresa) → compressione massima. SPERIMENTALE: rompe i tag XML; sicuro
     // solo se il contenuto compresso è IRRILEVANTE per il task (es. tool inutilizzati).
     static const bool no_protect = getenv("AIS_NO_PROTECT") != nullptr;
-    std::set<int> keep_set;
+    // keep_mask: O(n) bitmap (was std::set<int> → O(n log n) + per-insert alloc).
+    // Scanning 0..slice_N to build `keep` yields the same ascending order the set gave.
+    std::vector<char> keep_mask(slice_N, 0);
     for (int i = 0; i < slice_N; i++)
         if (i < anchor_size || i >= slice_N - recent_size || (!no_protect && xml_protected[i]) || surprises[i] >= threshold)
-            keep_set.insert(i);
+            keep_mask[i] = 1;
     if (eff_neighbor_win > 0 && !no_protect) {
         for (int i = 0; i < slice_N; i++) {
             if (surprises[i] >= eff_neigh_thr) {
                 int lo = std::max(0, i - eff_neighbor_win), hi = std::min(slice_N, i + eff_neighbor_win + 1);
                 while (lo > 0 && !starts_word(lo)) lo--;
                 while (hi < slice_N && !starts_word(hi)) hi++;
-                for (int k = lo; k < hi; k++) keep_set.insert(k);
+                for (int k = lo; k < hi; k++) keep_mask[k] = 1;
             }
         }
     }
-    { // word-completion forward pass
-        std::vector<int> snap(keep_set.begin(), keep_set.end());
-        for (int k : snap) { int j = k + 1; while (j < slice_N && !starts_word(j)) { keep_set.insert(j); j++; } }
+    { // word-completion forward pass (snapshot the current set so completions don't cascade)
+        std::vector<int> snap;
+        for (int i = 0; i < slice_N; i++) if (keep_mask[i]) snap.push_back(i);
+        for (int k : snap) { int j = k + 1; while (j < slice_N && !starts_word(j)) { keep_mask[j] = 1; j++; } }
     }
-    std::vector<int> keep(keep_set.begin(), keep_set.end());
-    fprintf(stderr, "📉 Compression: %.1f%% (%d → %d tok)\n",
+    std::vector<int> keep;
+    keep.reserve(slice_N);
+    for (int i = 0; i < slice_N; i++) if (keep_mask[i]) keep.push_back(i);
+    fprintf(stderr, "Compression: %.1f%% (%d → %d tok)\n",
             100.0f * (slice_N - (int)keep.size()) / slice_N, slice_N, (int)keep.size());
 
     if (out_kept) {
@@ -458,7 +502,7 @@ static int ais_do_encode(
         llama_memory_t mem = llama_get_memory(ctx);
         int run_start = -1;
         for (int i = 0; i <= slice_N; i++) {
-            bool is_kept = (i < slice_N) && (keep_set.count(i) > 0);
+            bool is_kept = (i < slice_N) && (keep_mask[i] != 0);
             if (!is_kept) {
                 if (run_start < 0) run_start = kv_start + i;
             } else {
@@ -522,15 +566,15 @@ static int ais_setup(
         float xd = quick_xml_density(vocab, raw);
         if (xd < 0.02f) {
             std::vector<llama_token> surv = dedup_prefilter(raw, cfg.anchor_size, cfg.recent_size, 4);
-            fprintf(stderr, "🧹 Dedup pre-gate: %d → %d tok (%.1f%% rimossi, xml=%.1f%%)\n",
+            fprintf(stderr, "Dedup pre-gate: %d → %d tok (%.1f%% rimossi, xml=%.1f%%)\n",
                     N, (int)surv.size(), 100.0f * (N - (int)surv.size()) / N, 100.0f * xd);
             raw = std::move(surv); N = (int)raw.size();
         } else {
-            fprintf(stderr, "🧹 Dedup pre-gate: saltato (xml-denso %.1f%%)\n", 100.0f * xd);
+            fprintf(stderr, "Dedup pre-gate: saltato (xml-denso %.1f%%)\n", 100.0f * xd);
         }
     }
 
-    fprintf(stderr, "📝 Tokens: %d | mode=%s param=%.2f\n",
+    fprintf(stderr, "Tokens: %d | mode=%s param=%.2f\n",
             N, adapt_mode.c_str(), adapt_mode == "fixed" ? cfg.surprise_threshold : adapt_param);
 
     // ── DELTA PATH ──────────────────────────────────────────────────────────
@@ -543,7 +587,7 @@ static int ais_setup(
         int P = 0, maxP = (int)ds->original_toks.size();
         while (P < maxP && P < N && raw[P] == ds->original_toks[P]) P++;
 
-        fprintf(stderr, "🔍 Delta check: P=%d maxP=%d N=%d\n", P, maxP, N);
+        fprintf(stderr, "Delta check: P=%d maxP=%d N=%d\n", P, maxP, N);
 
         if (P >= MIN_PARTIAL_PREFIX && N > P) {
             int D = N - P;
@@ -554,7 +598,7 @@ static int ais_setup(
             for (int i = 0; i < P && i < (int)ds->tok_kept.size(); i++)
                 if (ds->tok_kept[i]) kv_prefix_count++;
 
-            fprintf(stderr, "⚡ Delta: prefix=%d kv_pfx=%d delta=%d tok\n", P, kv_prefix_count, D);
+            fprintf(stderr, "Delta: prefix=%d kv_pfx=%d delta=%d tok\n", P, kv_prefix_count, D);
             llama_sampler_reset(smpl);
 
             // Rimuove token generati (dopo il prefisso originale) e eventuale coda.
@@ -595,7 +639,7 @@ static int ais_setup(
                 float d_var = 0.0f;
                 for (float s : d_surp) d_var += (s - d_avg) * (s - d_avg);
                 float d_std = std::sqrt(d_var / D);
-                fprintf(stderr, "📊 Delta: avg=%.2f bit\n", d_avg);
+                fprintf(stderr, "Delta: avg=%.2f bit\n", d_avg);
 
                 // ── THRESHOLD DELTA ──────────────────────────────────────────────
                 // Tre casi distinti basati su d_avg e d_std:
@@ -617,16 +661,16 @@ static int ais_setup(
                 float d_thr = 0.0f;
 
                 if (D <= SMALL_DELTA) {
-                    fprintf(stderr, "📐 Delta: small (%d tok), no filter\n", D);
+                    fprintf(stderr, "Delta: small (%d tok), no filter\n", D);
                 } else if (d_avg > 2.5f) {
                     d_thr = std::max(2.5f, d_avg - adapt_param * d_std);
-                    fprintf(stderr, "📐 Delta: dense, thr=%.2f bit\n", d_thr);
+                    fprintf(stderr, "Delta: dense, thr=%.2f bit\n", d_thr);
                 } else if (d_std > MIXED_STD_THR) {
                     // Distribuzione mista: token critici a bassa sorpresa (tool results,
                     // conferme "file scritto", reasoning interno agente). Tagliamo solo
                     // i token a sorpresa quasi-nulla (punteggiatura, spazi strutturali).
                     d_thr = 0.5f;
-                    fprintf(stderr, "📐 Delta: mixed (avg=%.2f std=%.2f), thr=0.50 bit\n",
+                    fprintf(stderr, "Delta: mixed (avg=%.2f std=%.2f), thr=0.50 bit\n",
                             d_avg, d_std);
                 } else {
                     // Distribuzione uniforme bassa: log, template, filler ripetitivo.
@@ -640,7 +684,7 @@ static int ais_setup(
                     } else {
                         d_thr = std::max(0.5f, d_avg + adapt_param * d_std);
                     }
-                    fprintf(stderr, "📐 Delta: low-entropy, thr=%.2f bit\n", d_thr);
+                    fprintf(stderr, "Delta: low-entropy, thr=%.2f bit\n", d_thr);
                 }
 
                 std::vector<bool> delta_kept;
@@ -660,7 +704,7 @@ static int ais_setup(
                     return n_past;
                 }
             }
-            fprintf(stderr, "⚠️  Delta failed, full re-encode\n");
+            fprintf(stderr, " Delta failed, full re-encode\n");
         }
     }
 
@@ -680,7 +724,7 @@ static int ais_setup(
         // il dedup sui tag rischierebbe la struttura e l'entropico rende troppo poco per
         // valere la tassa di scoring. Niente all-token lm_head, niente buffer → = vanilla.
         if (N < MIN_DOC_SIZE || xd >= 0.05f) {
-            fprintf(stderr, "🧭 Adaptive: NON comprimibile (xml=%.1f%% N=%d) → vanilla path (no scoring)\n",
+            fprintf(stderr, "Adaptive: NON comprimibile (xml=%.1f%% N=%d) → vanilla path (no scoring)\n",
                     100.0f * xd, N);
             auto tvp = std::chrono::steady_clock::now();
             batch.n_tokens = 0;
@@ -692,7 +736,7 @@ static int ais_setup(
                 if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "Decode error (vanilla path)\n"); return -1; }
                 batch.n_tokens = 0; offv = end;
             }
-            fprintf(stderr, "⏱️  Vanilla-path prefill: %.0fms (no scoring tax)\n",
+            fprintf(stderr, " Vanilla-path prefill: %.0fms (no scoring tax)\n",
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tvp).count());
             if (ds) { ds->original_toks = raw; ds->tok_kept.assign(N, true); ds->n_kv = N; ds->valid = true; }
             return N;
@@ -701,11 +745,11 @@ static int ais_setup(
         std::vector<llama_token> dd = dedup_prefilter(raw, cfg.anchor_size, cfg.recent_size, 4);
         float ddpct = (N > 0) ? (float)(N - (int)dd.size()) / N : 0.0f;
         if (ddpct >= 0.10f) {
-            fprintf(stderr, "🧭 Adaptive: comprimibile via dedup %.1f%% (%d→%d) → AIS\n",
+            fprintf(stderr, "Adaptive: comprimibile via dedup %.1f%% (%d→%d) → AIS\n",
                     100.0f * ddpct, N, (int)dd.size());
             raw = std::move(dd); N = (int)raw.size();
         } else {
-            fprintf(stderr, "🧭 Adaptive: comprimibile (entropico, xml=%.1f%% dedup=%.1f%%) → AIS\n",
+            fprintf(stderr, "Adaptive: comprimibile (entropico, xml=%.1f%% dedup=%.1f%%) → AIS\n",
                     100.0f * xd, 100.0f * ddpct);
         }
     }
@@ -831,7 +875,7 @@ static int ais_setup(
         double ma=vg_sum_a/vg_n, mb=vg_sum_b/vg_n;
         double cov=vg_sum_ab/vg_n-ma*mb, va=vg_sum_aa/vg_n-ma*ma, vb=vg_sum_bb/vg_n-mb*mb;
         double pear=cov/((va>0&&vb>0)?std::sqrt(va*vb):1e-9);
-        fprintf(stderr, "🔬 GATHER-DOT vs full lm_head over %ld positions: max|err|=%.4f  Pearson=%.6f  (full avg=%.3f, tgt avg=%.3f)\n",
+        fprintf(stderr, "GATHER-DOT vs full lm_head over %ld positions: max|err|=%.4f  Pearson=%.6f  (full avg=%.3f, tgt avg=%.3f)\n",
                 vg_n, vg_max_err, pear, ma, mb);
         // B3: fit true_bit_surprise ≈ slope*(-logit) + offset   (LN2=0.6931)
         double mt = vg_sum_true/vg_n, mn = vg_sum_nt/vg_n;
@@ -842,18 +886,18 @@ static int ais_setup(
         double r2 = (vt>0&&vn>0)? (covtn*covtn)/(vt*vn) : 0.0;
         // offset assuming the theoretical slope 1/ln2 (bits = -logit/ln2 + B):
         double B_theory = mt - (1.0/0.69314718)*mn;
-        fprintf(stderr, "🔬 BIT-FIT: true_avg=%.3f  -logit_avg=%.3f  | fit slope=%.4f offset=%.3f R^2=%.4f | B(slope=1/ln2)=%.3f\n",
+        fprintf(stderr, "BIT-FIT: true_avg=%.3f  -logit_avg=%.3f  | fit slope=%.4f offset=%.3f R^2=%.4f | B(slope=1/ln2)=%.3f\n",
                 mt, mn, slope, offset, r2, B_theory);
     }
     if (zcand_C > 0 && validate_gather && z_n > 0) {
         // VERDICT: err mean ≪ 0.05 bit (the sigma-mk cut margin) AND head-in-set ≈100% ⇒ a static
         // C-set captures Z ⇒ the lm_head can run on C columns only ("top-k senza calcolare su tutto").
         // Large err / low coverage ⇒ the head shifts per position ⇒ a static set is NOT enough.
-        fprintf(stderr, "🧪 ZCAND C=%d (static top-C from first %d pos) over %ld compare-pos: "
+        fprintf(stderr, "ZCAND C=%d (static top-C from first %d pos) over %ld compare-pos: "
                 "Z-surprise err mean=%.4f max=%.4f bit | Z_cand/Z_full mean=%.4f | head-in-set %.1f%%\n",
                 zcand_C, z_build_to, z_n, z_err_sum/z_n, z_err_max, z_frac_sum/z_n, 100.0*z_cover/z_n);
     }
-    fprintf(stderr, "⏱️  Pass1: total=%.0fms decode=%.0fms surprise=%.0fms\n",
+    fprintf(stderr, " Pass1: total=%.0fms decode=%.0fms surprise=%.0fms\n",
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pass1).count(),
             decode_ms, surprise_ms);
 
@@ -861,7 +905,7 @@ static int ais_setup(
     float s_avg = s_sum / N;
     float s_min = *std::min_element(surprises.begin(), surprises.end());
     float s_max = *std::max_element(surprises.begin(), surprises.end());
-    fprintf(stderr, "📊 Surprises: min=%.2f avg=%.2f max=%.2f bit\n", s_min, s_avg, s_max);
+    fprintf(stderr, "Surprises: min=%.2f avg=%.2f max=%.2f bit\n", s_min, s_avg, s_max);
     if (const char* dp = getenv("AIS_DUMP_SURPRISE")) {  // per-token dump for scorer A/B
         FILE* df = fopen(dp, "w");
         if (df) { for (int i = 0; i < N; i++) fprintf(df, "%d %.4f\n", raw[i], surprises[i]); fclose(df); }
@@ -884,7 +928,7 @@ static int ais_setup(
         bool short_doc = (adapt_mode == "sigma-mk" && N < MIN_DOC_SIZE);
         if (short_doc) {
             cfg.surprise_threshold = 0.0f;
-            fprintf(stderr, "📐 SIGMA-MK: use Pass1 KV (short doc)\n");
+            fprintf(stderr, "SIGMA-MK: use Pass1 KV (short doc)\n");
         } else if (gather_score) {
             // B3: in gather-score the surprise is pure -logit (the lm_head was
             // skipped, so there is NO logsumexp normalizer). Measured: -logit is
@@ -896,7 +940,7 @@ static int ais_setup(
             // outliers (codes, needles) reliably; it is a faster, lower-fidelity
             // filter than true-surprise sigma-mk, not a faithful replica.
             cfg.surprise_threshold = s_avg + adapt_param * s_std;
-            fprintf(stderr, "📐 GATHER-SCORE: scale-relative thr = avg + %.2f·σ = %.3f (-logit units)\n",
+            fprintf(stderr, "GATHER-SCORE: scale-relative thr = avg + %.2f·σ = %.3f (-logit units)\n",
                     adapt_param, cfg.surprise_threshold);
         } else if (adapt_mode == "sigma-mk" && s_avg > 2.5f) {
             // Dense doc: soglia = max(2.5, s_avg - adapt_param*s_std).
@@ -905,11 +949,11 @@ static int ais_setup(
             // Pass C protegge tool_result/error/output → sicuro anche con k < 1.0.
             const float FLOOR = 2.5f;
             cfg.surprise_threshold = std::max(FLOOR, s_avg - adapt_param * s_std);
-            fprintf(stderr, "📐 SIGMA-MK: dense doc, thr=%.2f bit\n",
+            fprintf(stderr, "SIGMA-MK: dense doc, thr=%.2f bit\n",
                     cfg.surprise_threshold);
         } else {
             cfg.surprise_threshold = std::max(0.5f, s_avg + adapt_param * s_std);
-            fprintf(stderr, "📐 SIGMA%s: thr=%.2f bit\n",
+            fprintf(stderr, "SIGMA%s: thr=%.2f bit\n",
                     adapt_mode == "sigma-mk" ? "-MK" : "", cfg.surprise_threshold);
         }
     }
@@ -945,7 +989,7 @@ static int ais_setup(
                 if (len > 0) cum += len;
             }
             adj_recent_size = std::max(cfg.recent_size, N - tok_idx);
-            fprintf(stderr, "🔀 Turn-aware: %zu turns, protecting last 2 (%d tok)\n",
+            fprintf(stderr, "Turn-aware: %zu turns, protecting last 2 (%d tok)\n",
                     turn_starts.size(), adj_recent_size);
         }
     }
@@ -956,7 +1000,7 @@ static int ais_setup(
     std::vector<bool> full_kept;
     if (use_pass1_kv) {
         batch.n_tokens = 0;
-        fprintf(stderr, "📉 Pass1 KV reused — 0%% compression\n");
+        fprintf(stderr, "Pass1 KV reused — 0%% compression\n");
         n_past = N;
         if (ds) full_kept.assign(N, true);  // tutti tenuti (pass1 kv)
     } else {
@@ -1069,17 +1113,17 @@ static std::string ais_infer(
                     batch.n_tokens = 0;
                 }
                 in_thought = false;
-                fprintf(stderr, "✂️  CoT: taglio a %d tok di pensiero (low_run=%d)\n",
+                fprintf(stderr, " CoT: taglio a %d tok di pensiero (low_run=%d)\n",
                         thought_toks, low_run);
                 continue;  // scarta 'id' (token di pensiero scontato), genera la risposta
             }
         }
-        if (llama_vocab_is_eog(vocab, id)) break;
+        if (ais_is_eog(vocab, id)) break;
         char buf[128];
         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n < 0) break;
         result.append(buf, n);
-        if (in_thought && result.find("<channel|>") != std::string::npos) in_thought = false;
+        if (in_thought && tail_contains(result, n, "<channel|>", 10)) in_thought = false;
         batch_add(batch, id, n_past, true);
         n_past++;
         generated++;
@@ -1087,7 +1131,7 @@ static std::string ais_infer(
         batch.n_tokens = 0;
     }
     double gen_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_gen).count();
-    fprintf(stderr, "⏱️  Gen: %d tok in %.0fms (%.1f tok/s)\n",
+    fprintf(stderr, " Gen: %d tok in %.0fms (%.1f tok/s)\n",
             generated, gen_ms, generated > 0 ? 1000.0 * generated / gen_ms : 0.0);
     if (out_completion_tok) *out_completion_tok = generated;
     return result;
@@ -1111,6 +1155,7 @@ struct SnapState {
     // ── AIS_SNAP_PROFILE: diagnostica costo (readback rilevanza + sweep eviction) ──
     bool   capturing    = true;  // false durante la GENERAZIONE → il cb_eval esce subito
                                  // (la rilevanza serve solo nel prefill) = decode senza tassa
+    bool   run_mode     = false; // running-eviction: per-chunk rel (host resets layers each chunk)
     bool   profile      = false;
     double rb_ms        = 0.0;   // tempo speso a leggere kq_soft_max dalla GPU
     size_t rb_bytes     = 0;     // byte trasferiti GPU→CPU per la rilevanza
@@ -1132,7 +1177,7 @@ static bool snap_eval_cb(struct ggml_tensor* t, bool ask, void* /*ud*/) {
         std::vector<float> buf(nkv);
         ggml_backend_tensor_get(t, buf.data(), 0, (size_t) nkv * sizeof(float));
         g_snap.rel.assign(buf.begin(), buf.end());
-        if (!g_snap.logged) { fprintf(stderr, "🧭 SnapKV cattura rel: %s n_kv=%d\n", t->name, nkv); g_snap.logged = true; }
+        if (!g_snap.logged) { fprintf(stderr, "SnapKV cattura rel: %s n_kv=%d\n", t->name, nkv); g_snap.logged = true; }
         return true;
     }
     // ROTTA C (hook generico flash-ON): "ais_snap_rel" è emesso PER-LAYER (non pre-sommato)
@@ -1143,6 +1188,18 @@ static bool snap_eval_cb(struct ggml_tensor* t, bool ask, void* /*ud*/) {
         if (ask) return is_rel;
         if (!is_rel || t->type != GGML_TYPE_F32) return true;
         const int nkv = (int) t->ne[0];
+        if (g_snap.run_mode) {
+            // running eviction: host resets g_snap.layers before each chunk. Size rel to THIS
+            // chunk's nkv on its first captured layer, then accumulate over layers. The max-nkv
+            // heuristic below can't be used here: n_kv shrinks after mid-prefill eviction.
+            std::vector<float> rbuf(nkv);
+            ggml_backend_tensor_get(t, rbuf.data(), 0, (size_t) nkv * sizeof(float));
+            if (g_snap.layers == 0) g_snap.rel.assign(nkv, 0.0);
+            if ((int) g_snap.rel.size() == nkv)
+                for (int k = 0; k < nkv; k++) g_snap.rel[k] += rbuf[k];
+            g_snap.layers++;
+            return true;
+        }
         if (nkv < (int) g_snap.rel.size()) return true;            // layer SWA o chunk più piccolo → ignora
         if (nkv > (int) g_snap.rel.size()) g_snap.rel.assign(nkv, 0.0);   // nuovo chunk più grande → reset
         auto t_rb = std::chrono::steady_clock::now();
@@ -1151,7 +1208,7 @@ static bool snap_eval_cb(struct ggml_tensor* t, bool ask, void* /*ud*/) {
         for (int k = 0; k < nkv; k++) g_snap.rel[k] += buf[k];
         if (g_snap.profile) { g_snap.rb_ms += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_rb).count(); g_snap.rb_bytes += (size_t)nkv*sizeof(float); }
         g_snap.layers++;
-        if (!g_snap.logged) { fprintf(stderr, "🧭 SnapKV FA cattura rel per-layer: %s n_kv=%d\n", t->name, nkv); g_snap.logged = true; }
+        if (!g_snap.logged) { fprintf(stderr, "SnapKV FA cattura rel per-layer: %s n_kv=%d\n", t->name, nkv); g_snap.logged = true; }
         return true;
     }
     if (!g_snap.on) return false;
@@ -1160,7 +1217,7 @@ static bool snap_eval_cb(struct ggml_tensor* t, bool ask, void* /*ud*/) {
     if (!is_kq || t->type != GGML_TYPE_F32) return true;
     const int n_kv = (int)t->ne[0], n_tok = (int)t->ne[1], n_head = (int)t->ne[2];
     if (!g_snap.logged) {
-        fprintf(stderr, "🔎 SnapKV cattura: %s ne=[%d,%d,%d]\n", t->name, n_kv, n_tok, n_head);
+        fprintf(stderr, "SnapKV cattura: %s ne=[%d,%d,%d]\n", t->name, n_kv, n_tok, n_head);
         g_snap.logged = true;
     }
     // accumula solo i layer ad attenzione PIENA (n_kv == N); salta SWA (finestra ridotta)
@@ -1221,6 +1278,11 @@ static bool find_common_block(const std::vector<llama_token>& a, const std::vect
         auto it = idx.find(h64(b, j));
         if (it == idx.end()) { j++; continue; }
         const int oi = it->second;
+        // Verify the B anchor tokens: the map key is only a 64-bit hash, so a
+        // collision would otherwise reuse a KV block that isn't actually equal.
+        bool anchor_eq = true;
+        for (int k = 0; k < B; k++) if (a[oi + k] != b[j + k]) { anchor_eq = false; break; }
+        if (!anchor_eq) { j++; continue; }
         int l = 0; while (oi - 1 - l >= 0 && j - 1 - l >= 0 && a[oi - 1 - l] == b[j - 1 - l]) l++;
         int r = 0; while (oi + B + r < Na && j + B + r < Nb && a[oi + B + r] == b[j + B + r]) r++;
         const int len = B + l + r;
@@ -1275,6 +1337,113 @@ static void snap_fast_topk(const std::vector<double>& rel, int N, int target, st
     for (int i = 0; i < N && added < k; i++) if (!keep[i] && rel[i] == thr) { keep[i] = true; added++; } // pari-soglia, ordine d'indice
 }
 
+// ── RUNNING EVICTION (AIS_SNAPKV_RUNEVICT, experimental) ─────────────────────────────────────
+// Evict DURING the chunked prefill of [lo,N) instead of once at the end, so later chunks attend
+// over a smaller KV (attention is O(ctx²) → cuts PREFILL FLOPs on long prompts and big deltas).
+// Relies on the append-only allocator (same env, core side) so physical slot == token position
+// holds across mid-prefill evictions — the SnapKV relevance hook is slot-indexed.
+//
+// DESIGN — "conservative accelerator, query-aware authority":
+//   • intermediate checkpoints DROP ONLY CLEAR LOSERS: tokens whose ACCUMULATED relevance (summed
+//     over all chunks so far = "attended by nobody") is below RUNFLOOR×peak. Dense content → none
+//     below floor → nothing dropped (do no harm). This just sheds obvious filler to speed prefill.
+//   • the FINAL checkpoint is the AUTHORITY: it ranks survivors by the TRUE final-window relevance
+//     and keeps the real target ratio. This defines the cached mask → multi-turn reuse stays
+//     query-aware (a weak running signal never decides what gets cached).
+//
+// Positions [0,lo) are an already-present (compressed) prefix and are NEVER evicted (reuse "do no
+// harm"). Fills keep_mask[lo..N); returns kept-count in [lo,N), or -1 to bail to a clean prefill.
+static int snap_runevict_prefill(llama_context* ctx, llama_memory_t mem, const llama_vocab* vocab,
+                                 llama_batch& batch, const std::vector<llama_token>& toks,
+                                 int lo, int N, float keep_ratio, std::vector<bool>& keep_mask) {
+    const int    CH       = 512;
+    const int    ANCHOR   = 8, RECENT = 64;
+    const int    EVERY    = std::max(CH, env_int("AIS_SNAPKV_RUNEVICT_EVERY", 4096));        // checkpoint stride
+    const double RKEEP    = std::min(0.99, std::max(0.10, env_float("AIS_SNAPKV_RUNEVICT_KEEP", 0.85)));  // intermediate keep (generous)
+
+    auto is_special = [&](int pos) {
+        const llama_token_attr at = llama_vocab_get_attr(vocab, toks[pos]);
+        return (at & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0;
+    };
+
+    std::vector<char>   live(N, 0);     // live[pos] for pos in [lo,N): prefilled & not evicted (pos == slot)
+    std::vector<double> acc (N, 0.0);   // accumulated relevance per position (do-no-harm running signal)
+    g_snap.run_mode  = true;
+    g_snap.capturing = true;
+    g_snap.rel.clear();
+    llama_set_eval_callback(ctx, snap_eval_cb, nullptr);
+    auto bail = [&]() -> int { g_snap.run_mode = false; llama_set_eval_callback(ctx, nullptr, nullptr); return -1; };
+
+    int next_ckpt = lo + EVERY;
+    for (int s = lo; s < N; s += CH) {
+        const int e = std::min(N, s + CH);
+        g_snap.layers = 0;                                          // reset accumulation for THIS chunk
+        batch.n_tokens = 0;
+        for (int i = s; i < e; i++) batch_add(batch, toks[i], i, i == N - 1);   // lm_head only on the final token
+        if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "RUNEVICT bail: decode fail @[%d,%d)\n", s, e); return bail(); }
+        batch.n_tokens = 0;
+        for (int i = s; i < e; i++) live[i] = 1;
+
+        const bool last = (e == N);
+        if (g_snap.layers == 0) { if (last) break; else continue; }  // no relevance captured (all-SWA?) → can't evict
+        if ((int) g_snap.rel.size() < e) {                          // slot/pos consistency check
+            fprintf(stderr, "RUNEVICT bail: rel.size=%zu < e=%d (layers=%d) @[%d,%d)\n",
+                    g_snap.rel.size(), e, g_snap.layers, s, e);
+            return bail();
+        }
+        for (int p = lo; p < e; p++) if (live[p]) acc[p] += g_snap.rel[p];   // accumulate the do-no-harm signal
+
+        if (e < next_ckpt && !last) continue;
+        next_ckpt += EVERY;
+
+        // candidates = live positions in [lo,e) that are NOT protected (anchor / recent end / special)
+        std::vector<int> cand;
+        int live_cnt = 0;
+        for (int p = lo; p < e; p++) {
+            if (!live[p]) continue;
+            live_cnt++;
+            if (p < lo + ANCHOR || p >= e - RECENT || is_special(p)) continue;
+            cand.push_back(p);
+        }
+        if (cand.empty()) continue;
+        const int protected_cnt = live_cnt - (int) cand.size();
+
+        if (!last) {
+            // CONSERVATIVE: keep the top RKEEP fraction of live by ACCUMULATED relevance (a token
+            // attended by ANY past window survives → do no harm). Generous budget caps the drop at
+            // (1−RKEEP) of live, so it sheds only the clear bottom; the final query-aware pass is the
+            // authority. NB: a floor relative to the peak is NOT safe — attention is power-law
+            // concentrated, so even a tiny floor would drop the majority.
+            std::sort(cand.begin(), cand.end(), [&](int a, int b){ return acc[a] > acc[b]; });
+            const int target = std::max(protected_cnt, (int)(RKEEP * live_cnt));
+            const int keep_c = std::max(0, target - protected_cnt);
+            if (keep_c >= (int) cand.size()) continue;              // nothing below the budget
+            for (int r = keep_c; r < (int) cand.size(); r++) live[cand[r]] = 0;
+        } else {
+            // FINAL = query-aware authority: keep the target ratio of survivors by final-window rel.
+            std::sort(cand.begin(), cand.end(), [&](int a, int b){ return g_snap.rel[a] > g_snap.rel[b]; });
+            const int target = std::max(protected_cnt, (int)((double) keep_ratio * live_cnt));
+            const int keep_c = std::max(0, target - protected_cnt);
+            if (keep_c >= (int) cand.size()) continue;              // nothing to drop
+            for (int r = keep_c; r < (int) cand.size(); r++) live[cand[r]] = 0;
+        }
+
+        std::vector<int8_t> maskE(e, 1);                            // keep prefix [0,lo) + protected; evict losers
+        for (int p = lo; p < e; p++) maskE[p] = live[p] ? 1 : 0;
+        llama_memory_seq_rm_mask(mem, 0, 0, maskE.data(), (uint32_t) e);
+        int now = 0; for (int p = lo; p < e; p++) now += live[p];
+        fprintf(stderr, "RUNEVICT ckpt @%d: %d→%d live%s\n", e, live_cnt, now,
+                last ? " (final, query-aware)" : " (conservative)");
+    }
+
+    g_snap.run_mode = false;
+    llama_set_eval_callback(ctx, nullptr, nullptr);
+    keep_mask.assign(N, false);
+    int kept = 0;
+    for (int p = lo; p < N; p++) if (live[p]) { keep_mask[p] = true; kept++; }
+    return kept;
+}
+
 static std::string ais_snapkv_infer(
     llama_context* ctx, const llama_vocab* vocab,
     llama_sampler* smpl, llama_batch& batch,
@@ -1298,7 +1467,7 @@ static std::string ais_snapkv_infer(
             std::vector<llama_token> dd = dedup_prefilter(toks, 8, 64, 8);
             if ((int)dd.size() < before) {
                 const float removed = (float)(before - (int)dd.size()) / before;
-                fprintf(stderr, "🧹 SnapKV dedup pre-gate: %d → %d tok (%.1f%% saltati dal prefill, gratis)\n",
+                fprintf(stderr, "SnapKV dedup pre-gate: %d → %d tok (%.1f%% saltati dal prefill, gratis)\n",
                         before, (int)dd.size(), 100.0f * removed);
                 toks = std::move(dd);
                 // Se il dedup ha già tolto molto (ridondante), il residuo è quasi-unico →
@@ -1307,7 +1476,7 @@ static std::string ais_snapkv_infer(
                 dedup_strong = (removed >= 0.50f);
             }
         } else {
-            fprintf(stderr, "🧹 SnapKV dedup pre-gate: saltato (xml-denso %.0f%%)\n", 100.0f * xd);
+            fprintf(stderr, "SnapKV dedup pre-gate: saltato (xml-denso %.0f%%)\n", 100.0f * xd);
         }
     }
     // ── LEXGATE (AIS_SNAPKV_LEXGATE): droppa il filler ISOLATO (bassa sorpresa lessicale e
@@ -1322,7 +1491,7 @@ static std::string ais_snapkv_infer(
         const int before = (int)toks.size();
         std::vector<llama_token> lg = lexgate_prefilter(vocab, toks, 8, 64, LW, LT, LC);
         if ((int)lg.size() < before) {
-            fprintf(stderr, "🔤 SnapKV lexgate%s: %d → %d tok (%.1f%% filler isolato saltato, gratis | win=%d thr=%.1f)\n",
+            fprintf(stderr, "SnapKV lexgate%s: %d → %d tok (%.1f%% filler isolato saltato, gratis | win=%d thr=%.1f)\n",
                     LC ? "[code]" : "", before, (int)lg.size(), 100.0f * (before - (int)lg.size()) / before, LW, LT);
             toks = std::move(lg);
             if ((float)(before - (int)toks.size()) / before >= 0.50f) dedup_strong = true;   // molto tolto → eviction gentile
@@ -1384,6 +1553,14 @@ static std::string ais_snapkv_infer(
     }
     const bool reuse = (ds && ds->valid && P >= 64 && P < N && (int)ds->tok_kept.size() >= P);
 
+    // RUNNING EVICTION applies only to a first-turn BIG single prefill (not reuse/diff): that's
+    // where prefill is the cost and there's no cached prefix to protect. Needs head-room for
+    // generation since the append-only allocator can't reuse evicted holes (N + gen ≤ n_ctx).
+    // value-based (not mere presence): AIS_SNAPKV_RUNEVICT=0 explicitly disables, =1 enables.
+    static const bool runevict_env = [](){ const char* v = getenv("AIS_SNAPKV_RUNEVICT"); return v && atoi(v) != 0; }();
+    const bool runevict_ok = runevict_env && !reuse && N >= 4 * CH
+                             && N + std::max(512, max_tokens) <= (int) llama_n_ctx(ctx);
+
     // ── CROSS-TURN DIFF-REUSE (AIS_SNAPKV_DIFF): riusa il PIÙ LUNGO blocco comune (corpo
     // file invariato) anche se cambia ai DUE lati (modifica + domanda nuova), dove il
     // prefix-reuse fallisce. Si tiene SOLO il blocco, lo si sposta a posizione (seq_add →
@@ -1395,7 +1572,7 @@ static std::string ais_snapkv_infer(
     static const bool diff_supported = [&]{
         const llama_rope_type rt = llama_model_rope_type(llama_get_model(ctx));
         const bool ok = rt != LLAMA_ROPE_TYPE_MROPE && rt != LLAMA_ROPE_TYPE_IMROPE && rt != LLAMA_ROPE_TYPE_VISION;
-        if (diff_en && !ok) fprintf(stderr, "🧩 SnapKV diff-reuse: NON supportato su questo modello (M-RoPE) → disattivo\n");
+        if (diff_en && !ok) fprintf(stderr, "SnapKV diff-reuse: NON supportato su questo modello (M-RoPE) → disattivo\n");
         return ok;
     }();
     int bo = -1, bn = -1, L = 0;
@@ -1425,13 +1602,13 @@ static std::string ais_snapkv_infer(
             kept = (int)std::count(nk.begin(), nk.end(), true);
             ds->original_toks = toks; ds->tok_kept = std::move(nk); ds->n_kv = kept; ds->valid = true;
             const int prefilled = bn + (N - (bn + L));
-            fprintf(stderr, "🧩 SnapKV diff-reuse: blocco comune L=%d riusato | prefill solo %d/%d tok (pre %d + post %d) | %.0fms\n",
+            fprintf(stderr, "SnapKV diff-reuse: blocco comune L=%d riusato | prefill solo %d/%d tok (pre %d + post %d) | %.0fms\n",
                     L, prefilled, N, bn, N - (bn + L),
                     std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_pf).count());
         } else {
             // FALLBACK SICURO: il riuso mid-blocco non è gestibile da questa cache (append-order
             // e/o ISWA sliding-window) → pulisci e fai un full prefill normale. Mai crashare.
-            fprintf(stderr, "🧩 SnapKV diff-reuse: non gestibile su questo modello (cache append/ISWA) → full prefill\n");
+            fprintf(stderr, "SnapKV diff-reuse: non gestibile su questo modello (cache append/ISWA) → full prefill\n");
             llama_memory_clear(mem, true);
             if (!pf_final(0)) { fprintf(stderr, "snapkv: fallback decode fail\n"); return "[error: decode]"; }
             kept = N;
@@ -1439,11 +1616,40 @@ static std::string ais_snapkv_infer(
         }
     } else if (reuse) {
         // ── DELTA: riusa il prefisso compresso [0,P), prefilla solo [P,N) ──
-        llama_memory_seq_rm(mem, 0, P, -1);   // via tutto da P (gen/delta del turno precedente)
+        llama_memory_seq_rm(mem, 0, P, -1);   // via tutto da P; con append-only head→used_max_p1=P (delta a [P,..))
         const int D = N - P;
-        if (!pf_final(P)) { fprintf(stderr, "snapkv: delta decode fail\n"); return "[error: decode]"; }
         int kv_pfx = 0;
         for (int i = 0; i < P; i++) if (ds->tok_kept[i]) kv_pfx++;
+
+        // ── DELTA RUNNING EVICTION: se il delta è GRANDE (log/output incollato) la sua attenzione
+        // interna O(D²) domina → evict DURANTE il suo prefill (cut FLOPs + comprime). Il prefisso
+        // [0,P) resta intatto (già compresso query-aware nel suo turno → reuse "do no harm"). Stesso
+        // schema del primo turno: conservative intermedio + finale query-aware (autorità della maschera).
+        const bool delta_runevict = runevict_env && D >= 4 * CH
+                                    && N + std::max(512, max_tokens) <= (int) llama_n_ctx(ctx);
+        bool delta_done = false;
+        if (delta_runevict) {
+            g_snap.logged = false;
+            std::vector<bool> dkm;
+            const int rk = snap_runevict_prefill(ctx, mem, vocab, batch, toks, /*lo=*/P, N, keep_ratio, dkm);
+            if (rk >= 0) {
+                std::vector<bool> nk(N, false);
+                for (int i = 0; i < P; i++) nk[i] = ds->tok_kept[i];   // prefisso: maschera invariata
+                for (int i = P; i < N; i++) nk[i] = dkm[i];
+                kept = kv_pfx + rk;
+                ds->original_toks = toks; ds->tok_kept = std::move(nk); ds->n_kv = kept;
+                fprintf(stderr, "SnapKV delta RUNEVICT: prefisso=%d(kv %d) + delta=%d→%d → %d tok | %.0fms\n",
+                        P, kv_pfx, D, rk, kept,
+                        std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_pf).count());
+                delta_done = true;
+            } else {
+                fprintf(stderr, "SnapKV delta RUNEVICT bail → normal delta prefill\n");
+                llama_memory_seq_rm(mem, 0, P, -1);   // clear any partially-evicted delta → clean redo below
+            }
+        }
+        if (delta_done) { /* handled above */ }
+        else {
+        if (!pf_final(P)) { fprintf(stderr, "snapkv: delta decode fail\n"); return "[error: decode]"; }
         std::vector<bool> nk(N, true);
         for (int i = 0; i < P; i++) nk[i] = ds->tok_kept[i];      // prefisso: maschera invariata
         // ── AUTO-MASS PER-TURNO: comprimi anche il DELTA se grande+ridondante (es. log/output
@@ -1451,11 +1657,11 @@ static std::string ais_snapkv_infer(
         // Tiene recent + speciali + top-rilevanza per massa (auto-MASS dalla ridondanza del delta).
         static const bool AUTO = getenv("AIS_SNAPKV_AUTO") != nullptr;
         int kept_delta = D;
-        // celle del delta nella KV (dopo la compattazione del prefisso): [kv_pfx, kv_pfx+D)
-        // → la rilevanza del token-delta j è g_snap.rel[kv_pfx + j]. La posizione ASSOLUTA è P+j.
-        const int dbase = kv_pfx;
+        // Senza append-only il prefisso è compattato → delta alle celle [kv_pfx, kv_pfx+D); con
+        // append-only slot==posizione → delta alle celle [P, P+D). Indicizza g_snap.rel di conseguenza.
+        const int dbase = runevict_env ? P : kv_pfx;
         if (AUTO && D >= 256 && (int)g_snap.rel.size() >= dbase + D) {
-            const int NG = 16; std::set<uint64_t> seen; long rep = 0, tot = 0;  // n-gram lungo: non conta i ripetuti STRUTTURALI brevi dell'XML
+            const int NG = 16; std::unordered_set<uint64_t> seen; long rep = 0, tot = 0;  // n-gram lungo: non conta i ripetuti STRUTTURALI brevi dell'XML
             for (int i = P; i + NG <= N; i++) { uint64_t h = 1469598103934665603ULL;
                 for (int j = 0; j < NG; j++) { h ^= (uint64_t)(uint32_t)toks[i + j]; h *= 1099511628211ULL; }
                 tot++; if (!seen.insert(h).second) rep++; }
@@ -1476,13 +1682,35 @@ static std::string ais_snapkv_infer(
             snap_fast_evict(mem, dk, P);                                         // evict delta non tenuti (single-pass, offset P)
             kept_delta = (int)std::count(dk.begin(), dk.end(), true);
             for (int j = 0; j < D; j++) nk[P + j] = dk[j];
-            fprintf(stderr, "🧮 SnapKV delta auto-MASS: red=%.3f mass=%.2f → delta %d→%d\n", red, mass, D, kept_delta);
+            fprintf(stderr, "SnapKV delta auto-MASS: red=%.3f mass=%.2f → delta %d→%d\n", red, mass, D, kept_delta);
         }
         kept = kv_pfx + kept_delta;
         ds->original_toks = toks; ds->tok_kept = std::move(nk); ds->n_kv = kept;
-        fprintf(stderr, "⚡ SnapKV delta: prefisso=%d (kv compresso=%d) + delta=%d (tenuti %d) → %d tok | %.0fms\n",
+        fprintf(stderr, "SnapKV delta: prefisso=%d (kv compresso=%d) + delta=%d (tenuti %d) → %d tok | %.0fms\n",
                 P, kv_pfx, D, kept_delta, kept,
                 std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_pf).count());
+        }   // chiude l'else del delta-runevict (path normale pf_final + auto-MASS)
+    } else if (runevict_ok) {
+        // ── RUNNING EVICTION: evict during prefill (cuts prefill FLOPs on long single prompts) ──
+        llama_memory_clear(mem, true);
+        g_snap.logged = false;
+        std::vector<bool> km;
+        const int rk = snap_runevict_prefill(ctx, mem, vocab, batch, toks, /*lo=*/0, N, keep_ratio, km);
+        if (rk < 0) {
+            // bail → clean full prefill fallback (no compression), never corrupts
+            fprintf(stderr, "RUNEVICT: bailed (validation/decode) → full prefill fallback\n");
+            llama_memory_clear(mem, true);
+            g_snap.rel.clear(); g_snap.logged = false;
+            if (!pf_final(0)) { fprintf(stderr, "snapkv: runevict fallback decode fail\n"); return "[error: decode]"; }
+            kept = N;
+            if (ds) { ds->original_toks = toks; ds->tok_kept.assign(N, true); ds->n_kv = N; ds->valid = true; }
+        } else {
+            kept = rk;
+            if (ds) { ds->original_toks = toks; ds->tok_kept = std::move(km); ds->n_kv = kept; ds->valid = true; }
+            fprintf(stderr, "SnapKV RUNEVICT: %d→%d tok (%.0f%% compresso, running) | %.0fms\n",
+                    N, kept, 100.0f * (N - kept) / N,
+                    std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_pf).count());
+        }
     } else {
         // ── PRIMO TURNO: prefill completo + eviction SnapKV ──
         llama_memory_clear(mem, true);
@@ -1502,7 +1730,7 @@ static std::string ais_snapkv_infer(
         if (kvbound_skip) {
             if (!pf_nocap(0)) { fprintf(stderr, "snapkv router: decode fail\n"); return "[error: decode]"; }
             kept = N;
-            fprintf(stderr, "⏭️  SnapKV router: N=%d < KV-bound %d → decode non KV-bound → niente rilevanza/eviction (prefill vanilla-equ.) | %.0fms\n",
+            fprintf(stderr, " SnapKV router: N=%d < KV-bound %d → decode non KV-bound → niente rilevanza/eviction (prefill vanilla-equ.) | %.0fms\n",
                     N, KVBOUND, std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_pf).count());
             if (ds) { ds->original_toks = toks; ds->tok_kept.assign(N, true); ds->n_kv = N; ds->valid = true; }
         } else {
@@ -1517,7 +1745,7 @@ static std::string ais_snapkv_infer(
             // sceglie il MASS. Contenuto UNICO/denso (codice) → ridondanza bassa → MASS alto
             // (tieni di più, recupero importante); RIDONDANTE (log/filler) → MASS basso (comprimi).
             // Misurato: codice red≈0.01→0.94 | Cline≈0.14→0.89 | filler≈0.94→0.70.
-            const int NG = 16; std::set<uint64_t> seen; long rep = 0, tot = 0;  // n-gram lungo: non conta i ripetuti STRUTTURALI brevi dell'XML
+            const int NG = 16; std::unordered_set<uint64_t> seen; long rep = 0, tot = 0;  // n-gram lungo: non conta i ripetuti STRUTTURALI brevi dell'XML
             for (int i = 0; i + NG <= N; i++) {
                 uint64_t h = 1469598103934665603ULL;
                 for (int j = 0; j < NG; j++) { h ^= (uint64_t)(uint32_t)toks[i + j]; h *= 1099511628211ULL; }
@@ -1525,10 +1753,10 @@ static std::string ais_snapkv_infer(
             }
             const double red = tot ? (double)rep / tot : 0.0;
             MASS = std::max(0.70, std::min(0.97, 0.95 - 0.45 * red));
-            fprintf(stderr, "🧮 SnapKV auto-MASS: ridondanza8=%.3f → MASS=%.2f\n", red, MASS);
+            fprintf(stderr, "SnapKV auto-MASS: ridondanza8=%.3f → MASS=%.2f\n", red, MASS);
         }
         if (dedup_strong && N > 0) {
-            fprintf(stderr, "🛡️  SnapKV: dedup forte → eviction per-rilevanza SALTATA (residuo quasi-unico, %d tok)\n", N);
+            fprintf(stderr, " SnapKV: dedup forte → eviction per-rilevanza SALTATA (residuo quasi-unico, %d tok)\n", N);
         } else if ((int)g_snap.rel.size() >= N && (MASS > 0.0 || keep_ratio < 0.999f)) {
             // FAST TOP-K (gate): col solo keep_ratio (count fisso) basta nth_element O(N) → si
             // SALTA il sort O(N log N). MASS accumula per massa → serve l'ordine → sort pieno.
@@ -1552,7 +1780,7 @@ static std::string ais_snapkv_infer(
                 const llama_token_attr at = llama_vocab_get_attr(vocab, toks[i]);
                 if ((at & LLAMA_TOKEN_ATTR_CONTROL) || (at & LLAMA_TOKEN_ATTR_USER_DEFINED)) { keep[i] = true; n_spec++; }
             }
-            if (n_spec) fprintf(stderr, "🔒 SnapKV: protetti %d token speciali (struttura)\n", n_spec);
+            if (n_spec) fprintf(stderr, "SnapKV: protetti %d token speciali (struttura)\n", n_spec);
             kept = (int)std::count(keep.begin(), keep.end(), true);
             if (MASS > 0.0) {
                 // KEEP ADATTIVO (Step 2): tieni i top-rilevanza finché coprono MASS della massa
@@ -1567,7 +1795,7 @@ static std::string ais_snapkv_infer(
                 static const double MINKEEP = [](){ const char* v = getenv("AIS_SNAPKV_MINKEEP"); return v ? atof(v) : 0.5; }();
                 const int floor_k = (int)(MINKEEP * N);
                 for (int r = 0; r < N && kept < floor_k; r++) { int i = idx[r]; if (!keep[i]) { keep[i] = true; kept++; } }
-                fprintf(stderr, "🎯 SnapKV keep adattivo (mass=%.2f, floor=%.2f) → %d/%d tenuti\n", MASS, MINKEEP, kept, N);
+                fprintf(stderr, "SnapKV keep adattivo (mass=%.2f, floor=%.2f) → %d/%d tenuti\n", MASS, MINKEEP, kept, N);
             } else {
                 const int target = std::max(anchor + recent, (int)(N * keep_ratio));
                 if (use_fast_topk) {
@@ -1594,7 +1822,7 @@ static std::string ais_snapkv_infer(
                 int saved = 0;
                 for (int i = anchor; i < N - recent; i++)
                     if (!keep[i] && (double)g_snap.rel[i] >= rthr) { keep[i] = true; kept++; saved++; }
-                if (saved) fprintf(stderr, "🛡️  SnapKV rel-floor %.2f×picco → riprotetti %d token rilevanti → %d/%d tenuti\n", RELFLOOR, saved, kept, N);
+                if (saved) fprintf(stderr, " SnapKV rel-floor %.2f×picco → riprotetti %d token rilevanti → %d/%d tenuti\n", RELFLOOR, saved, kept, N);
             }
             // ── REDUNDANCY-GATE — compressione SICURA a OGNI lunghezza (scelta 12/06) ──────
             // Evicta SOLO token lessicalmente RIDONDANTI: la prima occorrenza di ogni n-gram è
@@ -1606,7 +1834,7 @@ static std::string ais_snapkv_infer(
             static const bool REDGATE = getenv("AIS_SNAPKV_REDGATE") != nullptr;
             if (REDGATE && N > anchor + recent) {
                 static const int RNG = [](){ const char* v = getenv("AIS_SNAPKV_REDNG"); return v ? atoi(v) : 4; }();
-                std::set<uint64_t> seen;
+                std::unordered_set<uint64_t> seen;
                 std::vector<bool> redundant(N, false);
                 for (int i = 0; i + RNG <= N; i++) {
                     uint64_t h = 1469598103934665603ULL;
@@ -1616,15 +1844,17 @@ static std::string ais_snapkv_infer(
                 int saved = 0;
                 for (int i = anchor; i < N - recent; i++)
                     if (!keep[i] && !redundant[i]) { keep[i] = true; kept++; saved++; }   // UNICO → riproteggi
-                if (saved) fprintf(stderr, "🧱 SnapKV redgate(NG=%d): riprotetti %d token UNICI → %d/%d tenuti\n", RNG, saved, kept, N);
+                if (saved) fprintf(stderr, "SnapKV redgate(NG=%d): riprotetti %d token UNICI → %d/%d tenuti\n", RNG, saved, kept, N);
             }
             // ── LIVE EVICTION DUMP (viz) ──
             // AIS_EVICT_DUMP=path → one JSONL record with, for every token, its detokenized
             // piece + the REAL streaming SnapKV decision (kept flag) + attention relevance +
             // special-token flag. Drives the real-prompt eviction GIF (true model decisions).
             if (const char* evict_dump = getenv("AIS_EVICT_DUMP")) {
-                FILE* ef = fopen(evict_dump, "a");
-                if (ef) {
+                // unique_ptr deleter: the JSON-escaping below allocates (std::string) and can
+                // throw bad_alloc — RAII guarantees the handle is closed on every exit path.
+                std::unique_ptr<FILE, int(*)(FILE*)> efg(fopen(evict_dump, "a"), &fclose);
+                if (FILE* ef = efg.get()) {
                     fprintf(ef, "{\"slice_N\":%d,\"kept\":%d,\"mass\":%.3f,\"tokens\":[", N, kept, MASS);
                     char pc[512];
                     const bool have_rel = (int)g_snap.rel.size() >= N;
@@ -1650,7 +1880,6 @@ static std::string ais_snapkv_infer(
                                 have_rel ? g_snap.rel[i] : 0.0f, spec);
                     }
                     fprintf(ef, "]}\n");
-                    fclose(ef);
                 }
             }
             auto t_ev = std::chrono::steady_clock::now();
@@ -1659,15 +1888,15 @@ static std::string ais_snapkv_infer(
                 g_snap.evict_ms    += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_ev).count();
                 g_snap.evict_calls += runs;
             }
-            fprintf(stderr, "🗜️  SnapKV: %d→%d tok (%.0f%% compresso) | prefill %.0fms | rel n_kv=%zu\n",
+            fprintf(stderr, " SnapKV: %d→%d tok (%.0f%% compresso) | prefill %.0fms | rel n_kv=%zu\n",
                     N, kept, 100.0f * (N - kept) / N, pf_ms, g_snap.rel.size());
             if (g_snap.profile)
-                fprintf(stderr, "📊 PROFILE: readback %.1fms / %.1fMB | eviction %.2fms / %d scan (%s, N=%d → %ld cell-scan) | full-readback evitato %.0f×\n",
+                fprintf(stderr, "PROFILE: readback %.1fms / %.1fMB | eviction %.2fms / %d scan (%s, N=%d → %ld cell-scan) | full-readback evitato %.0f×\n",
                         g_snap.rb_ms, g_snap.rb_bytes / 1e6, g_snap.evict_ms, runs,
                         runs <= 1 ? "mask single-pass O(N)" : "run-wise O(R·N)", N, (long)runs * N,
                         g_snap.W > 0 ? 512.0 / g_snap.W : 1.0);
         } else {
-            fprintf(stderr, "⚠️  SnapKV: rel n_kv=%zu (N=%d)/keep=%.2f → no eviction (prefill %.0fms)\n",
+            fprintf(stderr, " SnapKV: rel n_kv=%zu (N=%d)/keep=%.2f → no eviction (prefill %.0fms)\n",
                     g_snap.rel.size(), N, keep_ratio, pf_ms);
         }
         if (ds) { ds->original_toks = toks; ds->tok_kept = keep; ds->n_kv = kept; ds->valid = true; }
@@ -1706,7 +1935,10 @@ static std::string ais_snapkv_infer(
     // fork Gemma-4 (modello "thinking"). In SnapKV GENERICO (qualsiasi modello) il tag
     // è privo di significato e il parser di canale non si applica → disattivato di
     // default; AIS_COT_FORCE per riabilitarlo esplicitamente.
-    const bool cot_enabled = !cot_off && (g_snap.fork || getenv("AIS_COT_FORCE") != nullptr);
+    // CoT-cut DEFAULT-ON: also honour AIS_COMPRESS_COT (set by OMNI for thinking/gemma models),
+    // so the non-streaming batch path matches the streaming path instead of needing the fork route.
+    const bool cot_enabled = !cot_off && (g_snap.fork || getenv("AIS_COMPRESS_COT") != nullptr
+                                          || getenv("AIS_COT_FORCE") != nullptr);
     const int think_cap = cot_think_cap(max_tokens);   // tetto pensiero → spazio garantito per la risposta
     const std::vector<llama_token> end_tag = ::common_tokenize(vocab, "<channel|>", false, true);
     // ── REASONING EVICTION (AIS_REASON_EVICT): a fine "pensiero" evicta dalla KV i token
@@ -1757,7 +1989,7 @@ static std::string ais_snapkv_infer(
                         if (ev && run0 < 0) run0 = j;
                         else if (!ev && run0 >= 0) { llama_memory_seq_rm(mem, 0, th[run0].first, th[j-1].first + 1); evicted += j - run0; run0 = -1; }
                     }
-                    if (evicted) fprintf(stderr, "🧹 Reason-evict: pensiero %d→%d tok in KV (−%d filler, keep=%.2f)\n", M, M - evicted, evicted, reason_keep);
+                    if (evicted) fprintf(stderr, "Reason-evict: pensiero %d→%d tok in KV (−%d filler, keep=%.2f)\n", M, M - evicted, evicted, reason_keep);
                 }
                 for (llama_token et : end_tag) {
                     char b[128]; int bn = llama_token_to_piece(vocab, et, b, sizeof(b), 0, true);
@@ -1766,15 +1998,15 @@ static std::string ais_snapkv_infer(
                     if (llama_decode(ctx, batch) != 0) { i = max_tokens; break; }
                 }
                 in_thought = false;
-                fprintf(stderr, "✂️  SnapKV CoT: taglio a %d tok di pensiero\n", thought_toks);
+                fprintf(stderr, " SnapKV CoT: taglio a %d tok di pensiero\n", thought_toks);
                 continue;
             }
         }
-        if (llama_vocab_is_eog(vocab, id)) break;
+        if (ais_is_eog(vocab, id)) break;
         char buf[128]; int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n < 0) break;
         result.append(buf, n);
-        if (in_thought && result.find("<channel|>") != std::string::npos) in_thought = false;
+        if (in_thought && tail_contains(result, n, "<channel|>", 10)) in_thought = false;
         if (reason_evict && in_thought && cur_surp >= 0.0) th.push_back({ n_past, (float) cur_surp });   // token di pensiero
         batch.n_tokens = 0; batch_add(batch, id, n_past, true); n_past++; gen++;
         if (llama_decode(ctx, batch) != 0) break; batch.n_tokens = 0;
@@ -1782,13 +2014,13 @@ static std::string ais_snapkv_infer(
     const double gen_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_gen).count();
     g_snap.capturing = true;                              // ripristina per il prefill successivo
     llama_set_eval_callback(ctx, snap_eval_cb, nullptr);  // ri-arma la cattura per il prossimo prefill
-    fprintf(stderr, "⏱️  SnapKV Gen: %d tok in %.0fms (%.1f tok/s)\n", gen, gen_ms, gen > 0 ? 1000.0 * gen / gen_ms : 0.0);
+    fprintf(stderr, " SnapKV Gen: %d tok in %.0fms (%.1f tok/s)\n", gen, gen_ms, gen > 0 ? 1000.0 * gen / gen_ms : 0.0);
     if (out_ct) *out_ct = gen;
     return result;
 }
 
 // Rileva una richiesta di CODING dal PROMPT (prima della generazione → niente trap) e, SE OPT-IN
-// (AIS_COT_NOCODE=1), disattiva il CoT-cut per quella richiesta. ⚠️ DEFAULT = OFF: misurato che
+// (AIS_COT_NOCODE=1), disattiva il CoT-cut per quella richiesta. DEFAULT = OFF: misurato che
 // togliere il taglio sul coding PEGGIORA i modelli thinking (budget-starvation: gemma-E2B 100%→33%,
 // gemma-26B 66.7%→0%) — il taglio è code-SAFE (mai tronca la risposta) E necessario perché il modello
 // risponda entro il budget. Quindi di default il taglio resta ATTIVO anche sul coding. Opt-in solo
@@ -1797,7 +2029,7 @@ static bool prompt_is_coding(const std::string& s) {
     if (!getenv("AIS_COT_NOCODE") || atoi(getenv("AIS_COT_NOCODE")) == 0) return false;  // OPT-IN (default OFF)
     if (s.find("```") != std::string::npos) return true;                                 // code fence
     int ang = 0; for (char c : s) if (c == '<' || c == '>') ang++;                       // XML/tool-def (Cline)
-    if ((int)s.size() > 200 && ang * 1000 / (int)s.size() > 25) return true;             // >2.5% parentesi angolari
+    if (s.size() > 200 && (long)ang * 1000 / (long)s.size() > 25) return true;           // >2.5% parentesi angolari (64-bit: no overflow su prompt MB)
     static const char* kw[] = {"def ", "function ", "class ", "import ", "#include", "public ",
         "const ", "return ", "write a function", "implement ", "fix the bug", "refactor", "debug",
         "stack trace", "Traceback", "</", "/>", "() {", ");", "```", "code block", "the function"};
@@ -1814,13 +2046,20 @@ int main(int argc, char** argv) {
     float       adapt_param = 0.0f;
     AISProbConfig cfg;
 
+    // Tolerant numeric parsing: a non-numeric CLI argument falls back to the
+    // default instead of throwing an uncaught exception that aborts the process.
+    auto safe_stof = [](const char* s, float d) { try { return std::stof(s); } catch (...) {
+        fprintf(stderr, " Invalid number '%s', using %.3f\n", s, d); return d; } };
+    auto safe_stoi = [](const char* s, int d)   { try { return std::stoi(s); } catch (...) {
+        fprintf(stderr, " Invalid integer '%s', using %d\n", s, d); return d; } };
+
     if (argc > 3) {
         adapt_mode  = argv[3];
-        adapt_param = std::stof(argv[2]);
+        adapt_param = safe_stof(argv[2], adapt_param);
     } else if (argc > 2) {
         std::string a2 = argv[2];
         if (a2 != "--server" && a2 != "--max-tokens" && a2 != "--ctx")
-            cfg.surprise_threshold = std::stof(a2);
+            cfg.surprise_threshold = safe_stof(a2.c_str(), cfg.surprise_threshold);
     }
 
     int         server_port = -1;
@@ -1838,27 +2077,29 @@ int main(int argc, char** argv) {
     };
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        if (a == "--server"       && i + 1 < argc) server_port   = std::stoi(argv[++i]);
+        if (a == "--server"       && i + 1 < argc) server_port   = safe_stoi(argv[++i], server_port);
         if (a == "--host"         && i + 1 < argc) server_host   = argv[++i];
-        if (a == "--max-tokens"   && i + 1 < argc) max_tokens    = std::stoi(argv[++i]);
-        if (a == "--ctx"          && i + 1 < argc) cfg.ctx_limit = std::stoi(argv[++i]);
+        if (a == "--max-tokens"   && i + 1 < argc) max_tokens    = safe_stoi(argv[++i], max_tokens);
+        if (a == "--ctx"          && i + 1 < argc) cfg.ctx_limit = safe_stoi(argv[++i], cfg.ctx_limit);
         if (a == "--cache-type-k" && i + 1 < argc) type_k        = kv_type_from_str(argv[++i]);
         if (a == "--cache-type-v" && i + 1 < argc) type_v        = kv_type_from_str(argv[++i]);
         if (a == "--flash-attn"   && i + 1 < argc) fa            = parse_fa(argv[++i]);
     }
 
     llama_backend_init();
+    struct BackendGuard { ~BackendGuard() { llama_backend_free(); } } backend_guard;  // freed last
 
     auto mparams = llama_model_default_params();
     mparams.n_gpu_layers = 99;
-    auto* model = llama_model_load_from_file(model_path, mparams);
+    ModelPtr model_guard(llama_model_load_from_file(model_path, mparams));
+    llama_model* model = model_guard.get();
     if (!model) { fprintf(stderr, "Failed to load model: %s\n", model_path); return 1; }
 
     const auto* vocab   = llama_model_get_vocab(model);
     const int   n_vocab = llama_vocab_n_tokens(vocab);
 
     // ════════════════════════════════════════════════════════════════════════
-    // 🏆 SnapKV BEST — la "forma finale": combina TUTTI i gain validati con un solo
+    // SnapKV BEST — la "forma finale": combina TUTTI i gain validati con un solo
     // flag, auto-selezionando la rotta di rilevanza migliore per il modello:
     //   • Gemma-4 → fork tuned (AIS_SNAPKV, flash ON, ais_snap_rel pre-sommato)
     //   • altri   → hook generico (AIS_SNAPKV_FA, flash ON, build_attn_mha)
@@ -1869,7 +2110,7 @@ int main(int argc, char** argv) {
     // AIS_SNAPKV_CODE = BEST + lexgate SYNTAX-AWARE (gate per il coding: comprime prosa/
     // commenti, protegge codice/identificatori/valori). Implica BEST.
     // ════════════════════════════════════════════════════════════════════════
-    // 🟢 AIS_OMNI — LA MODALITÀ FINALE (una flag, tutto incluso, chat + Cline, STREAMING + ogni
+    // AIS_OMNI — LA MODALITÀ FINALE (una flag, tutto incluso, chat + Cline, STREAMING + ogni
     // modello). = SnapKV (auto-route: gemma→fork tuned, ogni altro modello→hook FA generico flash-ON,
     // "compressione attaccata su FA") + dedup pre-gate + delta multi-turno + auto-MASS +
     // gate KV-bound (nessuna tassa sui prompt corti) + CoT-cut SOLO sui modelli thinking (gemma).
@@ -1894,6 +2135,12 @@ int main(int argc, char** argv) {
         set_def("AIS_SNAPKV_DEDUP", "1");
         set_def("AIS_SNAPKV_W",     "24");
         set_def("AIS_SNAPKV_KEEP",  "0.4");
+        // RUNNING EVICTION (AIS_SNAPKV_RUNEVICT) is intentionally NOT defaulted on. Measured
+        // (gemma-E2B, bench_final --think + standalone smoke, see ais/bench/RESULTS_kv_eviction.txt):
+        // when it sticks it helps (multi-turn 29.10s→27.93s, dense ptok 5917→3108), but on SWA models
+        // its slot/position check can BAIL mid-prefill (only full-attn layers capture relevance) and
+        // fall back to a full re-prefill — wasting the partial pass → SLOWER. Correctness is always
+        // preserved (clean fallback), but the speed is not, so it stays opt-in.
         // CoT-cut sui modelli THINKING (gemma): comprime il ragionamento → +veloce, qualità piena.
         // NON tocca il CODICE: il taglio opera SOLO nella fase di pensiero (in_thought). Con thinking
         // OFF (AIS_NO_THINK) o nella fase di RISPOSTA, in_thought=false → la risposta (codice incluso)
@@ -1913,7 +2160,7 @@ int main(int argc, char** argv) {
             type_k = type_v = GGML_TYPE_Q8_0;           // ½ memoria KV (paga ~7% prefill: solo se memory-bound)
         }
         const char* label = omni_code ? "OMNI+CODE" : (omni ? "OMNI" : (best_code ? "CODE" : "BEST"));
-        fprintf(stderr, "🟢 AIS %s: arch=%s → rotta FA(C) + AUTO + DEDUP%s%s + W24 + KEEP0.4 + KV=%s (KVQ8=%s)\n",
+        fprintf(stderr, "AIS %s: arch=%s → rotta FA(C) + AUTO + DEDUP%s%s + W24 + KEEP0.4 + KV=%s (KVQ8=%s)\n",
                 label, arch[0] ? arch : "?",
                 (omni && is_gemma && getenv("AIS_COMPRESS_COT")) ? " + CoT-cut[thinking-only]" : "",
                 best_code ? " + LEXGATE[code]" : "", ggml_type_name(type_k),
@@ -1938,7 +2185,7 @@ int main(int argc, char** argv) {
         // quello (la finestra-query globale è nelle sue ultime W righe).
         cparams.n_batch  = 512;
         cparams.n_ubatch = 512;
-        fprintf(stderr, "🔎 SnapKV PROBE attivo (W=%d, flash OFF, ubatch=512)\n", g_snap.W);
+        fprintf(stderr, "SnapKV PROBE attivo (W=%d, flash OFF, ubatch=512)\n", g_snap.W);
     }
     // SnapKV GENERIC (model-agnostic): rilevanza dal tensore CORE `kq_soft_max` via
     // cb_eval (path non-flash, emesso da build_attn_mha per OGNI architettura) → NON
@@ -1956,7 +2203,7 @@ int main(int argc, char** argv) {
         cparams.cb_eval_user_data = nullptr;
         cparams.n_batch  = 512;
         cparams.n_ubatch = 512;
-        fprintf(stderr, "🧭 SnapKV GENERIC (kq_soft_max probe, model-agnostic, flash OFF, ubatch=512, W=%d)\n", g_snap.W);
+        fprintf(stderr, "SnapKV GENERIC (kq_soft_max probe, model-agnostic, flash OFF, ubatch=512, W=%d)\n", g_snap.W);
     }
     // SnapKV FA (rotta C): hook GENERICO in build_attn_mha (src/llama-graph.cpp) → la
     // rilevanza [n_kv] è calcolata DENTRO il grafo, per-layer, con FLASH ON (lo slice
@@ -1972,10 +2219,10 @@ int main(int argc, char** argv) {
         cparams.cb_eval           = snap_eval_cb;          // cattura "ais_snap_rel" per-layer
         cparams.cb_eval_user_data = nullptr;
         // flash resta com'è (default ON/auto) → onora --cache-type-k/v e --flash-attn.
-        fprintf(stderr, "🧭 SnapKV FA (hook generico flash-ON, model-agnostic, KV=%s, W=%d)\n",
+        fprintf(stderr, "SnapKV FA (hook generico flash-ON, model-agnostic, KV=%s, W=%d)\n",
                 ggml_type_name(type_k), g_snap.W);
     }
-    fprintf(stderr, "🧠 KV cache: k=%s v=%s | flash_attn=%s\n",
+    fprintf(stderr, "KV cache: k=%s v=%s | flash_attn=%s\n",
             ggml_type_name(type_k), ggml_type_name(type_v),
             llama_flash_attn_type_name(fa));
     // Milestone B: embeddings(pooling NONE) makes the gemma4 graph emit per-token
@@ -1991,7 +2238,7 @@ int main(int argc, char** argv) {
             cparams.embeddings   = true;
             cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
         }
-        fprintf(stderr, "🔬 gather-dot mode (embeddings=%s, %s)\n", surprise_out ? "off/dedicated" : "on,pooling=none",
+        fprintf(stderr, "gather-dot mode (embeddings=%s, %s)\n", surprise_out ? "off/dedicated" : "on,pooling=none",
                 getenv("AIS_GATHER_SCORE") ? "skip-lm_head scoring" : "validate");
     }
     // SnapKV FORK (Milestone C rotta B): embeddings on → il grafo gemma4 emette la
@@ -2004,16 +2251,23 @@ int main(int argc, char** argv) {
         if (const char* w = getenv("AIS_SNAPKV_W")) g_snap.W = atoi(w);
         // KV onora --cache-type-k/v (q8_0 ok: la K cache viene dequantizzata a f16 nel grafo
         // per il mul_mat dello slice). lm_head ATTIVO (no embeddings) → logits per generare.
-        fprintf(stderr, "🧭 SnapKV FORK cached-K (chunked, flash ON, KV=%s)\n", ggml_type_name(type_k));
+        fprintf(stderr, "SnapKV FORK cached-K (chunked, flash ON, KV=%s)\n", ggml_type_name(type_k));
     }
-    auto* ctx = llama_init_from_model(model, cparams);
+    CtxPtr ctx_guard(llama_init_from_model(model, cparams));
+    llama_context* ctx = ctx_guard.get();
     if (!ctx) { fprintf(stderr, "Failed to create context\n"); return 1; }
 
     auto sparams = llama_sampler_chain_default_params();
-    auto* smpl   = llama_sampler_chain_init(sparams);
+    SamplerPtr smpl_guard(llama_sampler_chain_init(sparams));
+    llama_sampler* smpl = smpl_guard.get();
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
-    llama_batch batch = llama_batch_init(cparams.n_batch, 0, 1);
+    struct BatchGuard {
+        llama_batch b;
+        explicit BatchGuard(llama_batch batch) : b(batch) {}
+        ~BatchGuard() { llama_batch_free(b); }
+    } batch_guard(llama_batch_init(cparams.n_batch, 0, 1));
+    llama_batch& batch = batch_guard.b;
 
     // ==========================================
     // SERVER MODE
@@ -2161,7 +2415,7 @@ int main(int argc, char** argv) {
                 const bool coding_req = prompt_is_coding(prompt);
                 ss->in_thought    = (getenv("AIS_NO_THINK") == nullptr) && !coding_req;
                 if (coding_req && getenv("AIS_COMPRESS_COT"))
-                    fprintf(stderr, "🧑‍💻 CoT-cut OFF: coding rilevato nel prompt (no taglio)\n");
+                    fprintf(stderr, "CoT-cut OFF: coding rilevato nel prompt (no taglio)\n");
                 ss->max_tokens    = n_tokens;
                 ss->id        = "chatcmpl-" + random_id();
                 ss->created   = (int64_t)std::time(nullptr);
@@ -2177,7 +2431,10 @@ int main(int argc, char** argv) {
                     "text/event-stream; charset=utf-8",
                     [ss, ctx, vocab, smpl, &batch, n_vocab, &ds]
                     (size_t /*offset*/, httplib::DataSink& sink) -> bool {
-
+                      // try/catch around the whole provider: common_chat_parse() runs per token
+                      // and can throw — without this the request mutex (held via ss->lock) would
+                      // never be released and EVERY later request would deadlock.
+                      try {
                         auto send = [&](const std::string& s) -> bool {
                             return sink.write(s.data(), s.size());
                         };
@@ -2269,14 +2526,14 @@ int main(int argc, char** argv) {
                                 }
                                 batch.n_tokens = 0;
                                 ss->in_thought = false;
-                                fprintf(stderr, "✂️  CoT: taglio a %d tok di pensiero (low_run=%d)\n",
+                                fprintf(stderr, " CoT: taglio a %d tok di pensiero (low_run=%d)\n",
                                         ss->thought_toks, ss->low_run);
                                 ss->token_idx++;
                                 return true;  // scarta 'id', prossimo giro genera la risposta
                             }
                         }
 
-                        if (llama_vocab_is_eog(vocab, id)) {
+                        if (ais_is_eog(vocab, id)) {
                             ss->finished = true;
                             return true;  // manda [DONE] al prossimo giro
                         }
@@ -2284,7 +2541,7 @@ int main(int argc, char** argv) {
                         char buf[128];
                         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
                         if (n > 0) ss->raw.append(buf, n);
-                        if (ss->in_thought && ss->raw.find("<channel|>") != std::string::npos) ss->in_thought = false;
+                        if (ss->in_thought && tail_contains(ss->raw, n, "<channel|>", 10)) ss->in_thought = false;
                         // parse incrementale: invia SOLO il delta del canale finale.
                         // Durante il "thought" di Gemma-4 il content resta vuoto → niente leak.
                         common_chat_msg m = common_chat_parse(ss->raw, /*is_partial=*/true, ss->pp);
@@ -2325,6 +2582,16 @@ int main(int argc, char** argv) {
                         batch.n_tokens = 0;
                         ss->token_idx++;
                         return true;
+                      } catch (const std::exception& e) {
+                        fprintf(stderr, "stream provider error: %s\n", e.what());
+                        if (ss->snap) {   // ri-arma la cattura SnapKV anche su errore
+                            g_snap.capturing = true;
+                            llama_set_eval_callback(ctx, snap_eval_cb, nullptr);
+                        }
+                        if (ss->lock) ss->lock->unlock();   // mai lasciare il mutex bloccato
+                        sink.done();
+                        return false;
+                      }
                     }
                 );
 
@@ -2407,14 +2674,14 @@ int main(int argc, char** argv) {
 </head>
 <body>
 <div id="header">
-  <h1>⚡ AIS Chat</h1>
+  <h1>AIS Chat</h1>
   <span id="status">connessione...</span>
 </div>
 <div id="messages"></div>
 <div id="footer">
   <div id="form">
     <textarea id="input" placeholder="Scrivi un messaggio... (Invio = invia, Shift+Invio = nuova riga)" rows="1"></textarea>
-    <button id="clear" title="Pulisci chat">🗑</button>
+    <button id="clear" title="Pulisci chat">Pulisci</button>
     <button id="send">Invia</button>
   </div>
   <div id="info" id="info"></div>
@@ -2428,9 +2695,9 @@ async function checkStatus() {
   try {
     const r = await fetch(window.location.origin + "/health");
     const d = await r.json();
-    document.getElementById("status").textContent = d.status === "ok" ? "✅ online" : "⚠️ " + d.status;
+    document.getElementById("status").textContent = d.status === "ok" ? "online" : "" + d.status;
     document.getElementById("status").style.color = "#13eaad";
-  } catch { document.getElementById("status").textContent = "❌ offline"; }
+  } catch { document.getElementById("status").textContent = "offline"; }
 }
 
 function addMsg(role, text) {
@@ -2493,7 +2760,7 @@ async function send() {
         } catch {}
       }
     }
-  } catch(e) { reply = "❌ Errore: " + e.message; aEl.textContent = reply; }
+  } catch(e) { reply = "Errore: " + e.message; aEl.textContent = reply; }
 
   aEl.classList.remove("thinking");
   if (!reply) aEl.textContent = "(nessuna risposta)";
@@ -2543,7 +2810,7 @@ setInterval(checkStatus, 15000);
         });
 
         fprintf(stderr,
-            "\n🚀 AIS Server avviato\n"
+            "\nAIS Server avviato\n"
             "   Modello  : %s\n"
             "   Modalità : %s (param=%.2f)\n"
             "   URL      : http://%s:%d\n"
@@ -2553,18 +2820,13 @@ setInterval(checkStatus, 15000);
 
         svr.listen(server_host.c_str(), server_port);
 
-        llama_sampler_free(smpl);
-        llama_batch_free(batch);
-        llama_free(ctx);
-        llama_model_free(model);
-        llama_backend_free();
-        return 0;
+        return 0;   // model/ctx/sampler/batch/backend freed by RAII guards
     }
 
     // ==========================================
     // CLI MODE
     // ==========================================
-    fprintf(stderr, "🚀 AIS_PROB CLI (mode=%s param=%.2f)\n",
+    fprintf(stderr, "AIS_PROB CLI (mode=%s param=%.2f)\n",
             adapt_mode.c_str(), adapt_mode == "fixed" ? cfg.surprise_threshold : adapt_param);
 
     std::string input_buffer, line;
@@ -2575,24 +2837,24 @@ setInterval(checkStatus, 15000);
     if (g_snap.on && !input_buffer.empty()) {
         std::vector<llama_token> toks = common_tokenize(vocab, input_buffer, true, false);
         int N = (int)toks.size();
-        fprintf(stderr, "🔎 SnapKV PROBE: %d token (W=%d) → prefill (chunk 512)\n", N, g_snap.W);
+        fprintf(stderr, "SnapKV PROBE: %d token (W=%d) → prefill (chunk 512)\n", N, g_snap.W);
         auto t_pf = std::chrono::steady_clock::now();
         const int CH = 512;
         for (int s = 0; s < N; s += CH) {
             batch.n_tokens = 0;
             int e = std::min(N, s + CH);
             for (int i = s; i < e; i++) batch_add(batch, toks[i], i, i == N - 1);
-            if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "❌ decode fallito\n"); break; }
+            if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "decode fallito\n"); break; }
         }
         batch.n_tokens = 0;
-        fprintf(stderr, "⏱️  prefill(flash off): %.1fs\n",
+        fprintf(stderr, " prefill(flash off): %.1fs\n",
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pf).count());
         if ((int)g_snap.rel.size() >= N && N > 0) {   // n_kv può essere paddato > N (posizioni reali = [0,N))
             std::vector<int> idx(N);
             for (int i = 0; i < N; i++) idx[i] = i;
             std::sort(idx.begin(), idx.end(), [](int a, int b){ return g_snap.rel[a] > g_snap.rel[b]; });
             auto piece = [&](int i){ char b[64]; int n = llama_token_to_piece(vocab, toks[i], b, sizeof(b), 0, true); return std::string(b, n > 0 ? n : 0); };
-            fprintf(stderr, "✅ layer pieni catturati: %d\n", g_snap.layers);
+            fprintf(stderr, "layer pieni catturati: %d\n", g_snap.layers);
             printf("\n=== TOP 20 RILEVANTI (attesi: query + token a cui guarda) ===\n");
             for (int r = 0; r < std::min(20, N); r++) { int i = idx[r];     printf("  #%2d pos=%4d rel=%.3f  %s\n", r + 1, i, g_snap.rel[i], piece(i).c_str()); }
             printf("\n=== BOTTOM 20 (attesi: filler irrilevante) ===\n");
@@ -2614,14 +2876,14 @@ setInterval(checkStatus, 15000);
                 auto t_ev = std::chrono::steady_clock::now();
                 const int scans = snap_fast_evict(mem, keep);     // single-pass O(N) (vs run-wise O(R·N))
                 const double ev_ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - t_ev).count();
-                fprintf(stderr, "🗜️  SnapKV eviction: tenuti %d/%d → %.1f%% compresso | %.2fms / %d scan (%s, %ld cell-scan)\n",
+                fprintf(stderr, " SnapKV eviction: tenuti %d/%d → %.1f%% compresso | %.2fms / %d scan (%s, %ld cell-scan)\n",
                         kept, N, 100.0f * (N - kept) / N, ev_ms, scans,
                         scans <= 1 ? "mask O(N)" : "run-wise O(R·N)", (long)scans * N);
                 std::string ans; int n_past = N;
                 for (int t = 0; t < 48; t++) {
                     llama_token id = llama_sampler_sample(smpl, ctx, -1);
                     llama_sampler_accept(smpl, id);
-                    if (llama_vocab_is_eog(vocab, id)) break;
+                    if (ais_is_eog(vocab, id)) break;
                     char b[128]; int n = llama_token_to_piece(vocab, id, b, sizeof(b), 0, true);
                     if (n > 0) ans.append(b, n);
                     batch.n_tokens = 0; batch_add(batch, id, n_past, true); n_past++;
@@ -2630,24 +2892,24 @@ setInterval(checkStatus, 15000);
                 printf("\n=== RISPOSTA dopo eviction query-aware (tenuto %.0f%%) ===\n%s\n", ratio * 100, ans.c_str());
             }
         } else {
-            fprintf(stderr, "⚠️ rel.size=%zu != N=%d (prefill in chunk? usa prompt < n_batch)\n", g_snap.rel.size(), N);
+            fprintf(stderr, "rel.size=%zu != N=%d (prefill in chunk? usa prompt < n_batch)\n", g_snap.rel.size(), N);
         }
     } else if (getenv("AIS_SNAPKV") && !input_buffer.empty()) {
         // ── SnapKV FORK cached-K (rotta B): prefill CHUNKED (flash on, no OOM); la rilevanza
         // arriva da "ais_snap_rel" via cb_eval (g_snap.rel, tenuta col n_kv massimo). ──
         std::vector<llama_token> toks = common_tokenize(vocab, input_buffer, true, false);
         int N = (int)toks.size();
-        fprintf(stderr, "🧭 SnapKV FORK cached-K: %d token (W=%d) → prefill chunked (512)\n", N, g_snap.W);
+        fprintf(stderr, "SnapKV FORK cached-K: %d token (W=%d) → prefill chunked (512)\n", N, g_snap.W);
         auto t0 = std::chrono::steady_clock::now();
         const int CH = 512;
         for (int s = 0; s < N; s += CH) {
             batch.n_tokens = 0;
             int e = std::min(N, s + CH);
             for (int i = s; i < e; i++) batch_add(batch, toks[i], i, true);  // multi-output → salta lm_head
-            if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "❌ decode fallito\n"); break; }
+            if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "decode fallito\n"); break; }
         }
         batch.n_tokens = 0;
-        fprintf(stderr, "⏱️  prefill(flash ON, chunked): %.1fs | rel n_kv=%zu\n",
+        fprintf(stderr, " prefill(flash ON, chunked): %.1fs | rel n_kv=%zu\n",
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), g_snap.rel.size());
         if ((int)g_snap.rel.size() >= N && N > 0) {
             std::vector<int> idx(N); for (int i = 0; i < N; i++) idx[i] = i;
@@ -2675,12 +2937,12 @@ setInterval(checkStatus, 15000);
                     if (ev && run < 0) run = i;
                     else if (!ev && run >= 0) { llama_memory_seq_rm(mem, 0, run, i); run = -1; }
                 }
-                fprintf(stderr, "🗜️  eviction: tenuti %d/%d → %.1f%% compresso\n", kept, N, 100.0f * (N - kept) / N);
+                fprintf(stderr, " eviction: tenuti %d/%d → %.1f%% compresso\n", kept, N, 100.0f * (N - kept) / N);
                 std::string ans; int n_past = N;
                 for (int t = 0; t < 64; t++) {
                     llama_token id = llama_sampler_sample(smpl, ctx, -1);
                     llama_sampler_accept(smpl, id);
-                    if (llama_vocab_is_eog(vocab, id)) break;
+                    if (ais_is_eog(vocab, id)) break;
                     char b[128]; int n = llama_token_to_piece(vocab, id, b, sizeof(b), 0, true);
                     if (n > 0) ans.append(b, n);
                     batch.n_tokens = 0; batch_add(batch, id, n_past, true); n_past++;
@@ -2689,7 +2951,7 @@ setInterval(checkStatus, 15000);
                 printf("\n=== RISPOSTA dopo eviction SnapKV (tenuto %.0f%%) ===\n%s\n", ratio * 100, ans.c_str());
             }
         } else {
-            fprintf(stderr, "⚠️ rel.size=%zu < N=%d (cattura ais_snap_rel fallita?)\n", g_snap.rel.size(), N);
+            fprintf(stderr, "rel.size=%zu < N=%d (cattura ais_snap_rel fallita?)\n", g_snap.rel.size(), N);
         }
     } else if (!input_buffer.empty()) {
         std::string response = ais_infer(
@@ -2698,10 +2960,5 @@ setInterval(checkStatus, 15000);
         std::cout << response << std::endl;
     }
 
-    llama_sampler_free(smpl);
-    llama_batch_free(batch);
-    llama_free(ctx);
-    llama_model_free(model);
-    llama_backend_free();
-    return 0;
+    return 0;   // model/ctx/sampler/batch/backend freed by RAII guards
 }
