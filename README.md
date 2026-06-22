@@ -145,6 +145,25 @@ context grows: at 10k input tokens vanilla processes 10,132 tokens, AIS **123 (�
 ![bench redundancy](ais/img/bench_redundancy.png)
 ![bench redundancy](ais/img/bench_scaling.png)
 
+### CoT-cut — isolated, on a thinking model (gemma-4-E2B, thinking on)
+
+CoT-cut trims the *thinking* phase of a reasoning model (never the answer/code). Same compression on
+both sides — `vanilla` vs AIS with the cut **ON** vs **OFF**:
+
+| Scenario | vanilla | AIS · cut ON | AIS · cut OFF | cut effect (ON vs OFF) |
+|---|---|---|---|---|
+| Single dense        | 20.9s · 175 tok | 19.5s · 125 tok | 21.7s · 174 tok | 1.11× faster, −28% thinking tokens |
+| Single redundant    | 11.0s · 184 tok | **4.0s · 137 tok** | 7.3s · 256 tok¹ | **1.84× faster** |
+| Multi-turn (5, cum) | 34.8s           | 27.9s           | 31.1s           | 1.11× faster |
+| Peak RSS            | 5.60 GB         | 5.26 GB         | 5.26 GB         | — |
+
+¹ With the cut **OFF** the model ran to the full 256-token budget without committing to the answer —
+a **needle miss** (reproduced across two clean runs). The cut forces it to stop thinking and answer:
+faster **and** correct. The gain is largest on redundant context; on dense prompts the thought is
+already short (~1.1×).
+
+![CoT-cut benchmark](ais/img/bench_cotcut.png)
+
 
 ## Get started (from zero, ~5 commands)
 
