@@ -134,69 +134,15 @@ All scenarios recall the needle, except one multi-turn case (ais 3/4 vs vanilla 
 
 *Prefill on the 8B: redundant context 33.2s → 0.67s (50×); dense ~parity. This is where compression pays.*
 
-<table>
-<tr>
-<td><img src="ais/img/bench_unified_qwen.png" width="430"/></td>
-<td><img src="ais/img/bench_unified_gemma.png" width="430"/></td>
-</tr>
-<tr>
-<td align="center"><sub>Qwen-8B — speed / accuracy (Δ0) / RAM / tokens, one view</sub></td>
-<td align="center"><sub>gemma-E2B — the same four metrics</sub></td>
-</tr>
-</table>
+![unified qwen](ais/img/bench_unified_qwen.png)
+![unified gemma](ais/img/bench_unified_gemma.png)
 
 **Adaptive — compresses with redundancy, keeps dense input.** Compression scales **43% → 92%** as
 prompt redundancy goes 0 → 97%, with the needle preserved at every level. The KV stays ~flat as
 context grows: at 10k input tokens vanilla processes 10,132 tokens, AIS **123 (−99%)**.
 
-<table>
-<tr>
-<td><img src="ais/img/bench_redundancy.png" width="430"/></td>
-<td><img src="ais/img/bench_scaling.png" width="430"/></td>
-</tr>
-<tr>
-<td align="center"><sub>Compression vs prompt redundancy (needle OK at every level)</sub></td>
-<td align="center"><sub>Tokens processed vs context length — AIS stays flat</sub></td>
-</tr>
-</table>
-
-**Also previously validated on the production 26B** (gemma-4-26B-A4B, thinking-on, f16): redundant
-**7.4×**, multi-turn **1.31×**, single-turn parity, RAM −5%, needle 4/4.
-
-![26B](ais/img/omni_26b.png)
-
-### Quality — compression must not change the answer
-
-MMLU-Pro + HumanEval, **streamed, compression active**, vanilla vs AIS. The long-context MMLU case
-wraps each question in ~3k tokens of filler so the router actively evicts while answering.
-
-| Benchmark | Qwen3VL-8B (van → AIS) | gemma-4-E2B (van → AIS) |
-|---|---|---|
-| MMLU-Pro | 55.0% → 55.0% | 35.0% → 35.0% |
-| MMLU long-context (compression active) | 80.0% → 80.0% | 40.0% → 40.0% |
-| HumanEval pass@1 | 87.5% → 87.5% | 100% → 100% |
-
-
-**OMNI's code-safe CoT-cut (thinking models) is a SPEED feature — quality-neutral at a fair budget.**
-A thinking model needs room to finish thinking *and* answer; under a tight 512-token budget vanilla
-runs out mid-thought and *looks* like it collapses. Give both a fair 4096-token budget and vanilla
-recovers — and the cut **matches** it (Δ≈0):
-
-| gemma-E2B, thinking on | vanilla @512 | vanilla @4096 (fair) | cut ON @4096 |
-|---|---|---|---|
-| MMLU-Pro | 15% | **62.5%** | 62.5% |
-| HumanEval | 25% | **87.5%** | 100% |
-| code multi-turn | 0% | **100%** | 100% |
-| GSM8K math | 5% | **62.5%** | 62.5% |
-
-### A note — HumanEval sometimes improved (less noise?)
-
-In fact the chart shows the cut isn't just neutral — on **HumanEval it scored *higher* with AIS OMNI**
-(87.5% → **100%** at the same fair budget). The likely reason: trimming low-information, rambling
-chain-of-thought removes noise the model would otherwise condition on, so it commits to cleaner code.
-Small N (8 problems), so read it as suggestive, not proof — but it's a real "compression helped" data point.
-
-![CoT-cut: a real speed win (left); quality-neutral at a fair budget (right)](ais/img/cotcut.png)
+![bench redundancy](ais/img/bench_redundancy.png)
+![bench redundancy](ais/img/bench_scaling.png)
 
 
 ## Get started (from zero, ~5 commands)
