@@ -141,7 +141,6 @@ prompt redundancy goes 0 → 97%, with the needle preserved at every level. The 
 context grows: at 10k input tokens vanilla processes 10,132 tokens, AIS **123 (−99%)**.
 
 ![bench redundancy](ais/img/bench_redundancy.png)
-![bench redundancy](ais/img/bench_scaling.png)
 
 ### CoT-cut — isolated, on a thinking model (gemma-4-E2B, thinking on)
 
